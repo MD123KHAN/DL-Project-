@@ -1,0 +1,261 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#090d12">
+    <meta name="description" content="Explore car models, variants, engine specifications and performance with AutoNex.">
+    <title>AutoNex | Car Intelligence</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <header class="navbar">
+        <a class="brand" href="#" aria-label="AutoNex home">
+            <span class="brand-icon">A</span>
+            <span>AutoNex <span class="accent"></span></span>
+        </a>
+        <span class="nav-tag">CAR INTELLIGENCE</span>
+    </header>
+
+    <main class="container">
+        <section class="hero">
+            <p class="eyebrow">YOUR PERSONAL CAR EXPERT</p>
+
+            <h1>Discover your next <span>drive.</span></h1>
+
+            <p class="hero-description">
+                Explore car models, variants, engines, performance
+                and specifications with AutoNex.
+            </p>
+
+            <form id="searchForm" class="search-form">
+                <span class="search-icon" aria-hidden="true">⌕</span>
+
+                <div class="search-input-wrap">
+                    <input
+                        id="carInput"
+                        type="search"
+                        placeholder="Try Mahindra Scorpio N Z4 2026"
+                        aria-label="Search vehicle, variant or year"
+                        aria-autocomplete="list"
+                        aria-controls="suggestionList"
+                        aria-expanded="false"
+                        autocomplete="off"
+                        spellcheck="false"
+                        required
+                    >
+
+                    <div
+                        id="suggestionList"
+                        class="suggestion-list hidden"
+                        role="listbox"
+                        aria-label="Matching vehicles">
+                    </div>
+                </div>
+
+                <button id="searchButton" type="submit">
+                    Explore car <span aria-hidden="true">↗</span>
+                </button>
+            </form>
+
+            <p class="search-tip">
+                Start typing a manufacturer, model, variant or year.
+            </p>
+
+            <div class="quick-search">
+                <span class="try-label">TRY:</span>
+
+                <button type="button" class="suggestion"
+                        data-car="Mahindra Scorpio N Z4 2026">
+                    Scorpio N Z4
+                </button>
+
+                <button type="button" class="suggestion"
+                        data-car="Mahindra Scorpio N Z8L 2026">
+                    Scorpio N Z8L
+                </button>
+
+                <button type="button" class="suggestion"
+                        data-car="Mahindra Thar Roxx">
+                    Thar Roxx
+                </button>
+
+                <button type="button" class="suggestion"
+                        data-car="Maruti Suzuki Swift">
+                    Swift
+                </button>
+
+                <button type="button" class="suggestion"
+                        data-car="Tata Nexon">
+                    Tata Nexon
+                </button>
+            </div>
+        </section>
+
+        <div id="status" class="status"
+             role="status" aria-live="polite">
+            Search for a car to view its details.
+        </div>
+
+        <section id="results" class="results hidden"
+                 aria-label="Vehicle details">
+
+            <article class="car-card">
+                <div class="image-panel">
+                    <span class="image-badge">VEHICLE PREVIEW</span>
+
+                    <img id="carImage"
+                         alt="Vehicle preview"
+                         hidden>
+
+                    <div id="imagePlaceholder"
+                         class="image-placeholder">
+                        <span class="car-icon" aria-hidden="true">🚘</span>
+                        <p>Car image will appear here</p>
+                    </div>
+
+                    <div id="imageAttribution"
+                         class="image-attribution"></div>
+                </div>
+
+                <div class="car-details">
+                    <p id="manufacturerLabel" class="eyebrow">
+                        VEHICLE PROFILE
+                    </p>
+
+                    <h2 id="carName">Car model</h2>
+
+                    <p id="carDescription" class="description"></p>
+
+                    <div class="section-heading">
+                        <h3>Specifications</h3>
+                    </div>
+
+                    <div id="specGrid" class="spec-grid"></div>
+
+                    <div class="source-line">
+                        <span>DATA SOURCE</span>
+
+                        <a id="sourceLink"
+                           href="#"
+                           target="_blank"
+                           rel="noopener noreferrer"
+                           hidden>
+                            View source ↗
+                        </a>
+
+                        <span id="sourceText">AutoNex dataset</span>
+                    </div>
+                </div>
+            </article>
+
+<!-- AutoNex AI: Compare two vehicles -->
+<section id="compareSection" class="compare-section">
+    <div class="compare-heading">
+        <p class="eyebrow">POWERED BY AUTONEX AI</p>
+        <h2>Compare your <span>next drive.</span></h2>
+        <p>
+            Compare vehicle specifications and explore which car
+            better suits your needs.
+        </p>
+    </div>
+
+    <form id="compareForm" class="compare-form">
+        <div class="compare-inputs">
+            <label>
+                First vehicle
+                <input
+                    id="compareCar1"
+                    type="text"
+                    placeholder="Mahindra Thar"
+                    value="Mahindra Thar"
+                    maxlength="150"
+                    required
+                >
+            </label>
+
+            <div class="versus">VS</div>
+
+            <label>
+                Second vehicle
+                <input
+                    id="compareCar2"
+                    type="text"
+                    placeholder="Mahindra Scorpio N"
+                    value="Mahindra Scorpio N"
+                    maxlength="150"
+                    required
+                >
+            </label>
+        </div>
+
+        <label class="compare-question-label" for="compareQuestion">
+            What matters most to you?
+        </label>
+
+        <select id="compareQuestion" class="compare-select">
+            <option value="family">Family use and comfort</option>
+            <option value="city">City driving</option>
+            <option value="highway">Highway trips</option>
+            <option value="offroad">Off-road driving</option>
+            <option value="economy">Fuel economy and running costs</option>
+            <option value="performance">Engine and performance</option>
+        </select>
+
+        <button id="compareButton" type="submit" class="compare-button">
+            Compare with AutoNex AI <span aria-hidden="true">↗</span>
+        </button>
+    </form>
+
+    <div
+        id="compareStatus"
+        class="compare-status"
+        role="status"
+        aria-live="polite"
+    ></div>
+
+    <div id="compareResults" class="compare-results hidden">
+        <div class="comparison-cards">
+            <article class="comparison-card">
+                <p class="eyebrow">VEHICLE 01</p>
+                <h3 id="compareName1">First vehicle</h3>
+                <div id="compareSpecs1" class="comparison-specs"></div>
+            </article>
+
+            <article class="comparison-card">
+                <p class="eyebrow">VEHICLE 02</p>
+                <h3 id="compareName2">Second vehicle</h3>
+                <div id="compareSpecs2" class="comparison-specs"></div>
+            </article>
+        </div>
+
+        <article class="ai-analysis-card">
+            <div class="ai-analysis-heading">
+                <span class="ai-indicator">AI</span>
+                <div>
+                    <h3>AutoNex AI Analysis</h3>
+                    <p id="compareAnalysisSource">AI comparison grounded in vehicle data</p>
+                </div>
+            </div>
+
+            <div id="compareAnalysis" class="compare-analysis"></div>
+
+            <p id="compareDisclaimer" class="compare-disclaimer">
+                Specifications depend on the selected variant and model year.
+            </p>
+        </article>
+    </div>
+</section>
+
+        </section>
+
+        <footer>
+            <p>AutoNex · Built for automotive exploration</p>
+        </footer>
+    </main>
+
+    <script src="script.js" defer></script>
+</body>
+</html>
