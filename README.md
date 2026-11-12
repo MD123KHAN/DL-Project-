@@ -109,7 +109,7 @@ AutoNex runs as one Render Web Service: Flask serves both the frontend and API f
    | Build Command | `pip install -r requirements.txt` |
    | Start Command | `gunicorn --chdir backend app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 180` |
 
-3. Leave Environment Variables empty, then click **Deploy Web Service**. The repository's `.python-version` selects Python 3.13.
+3. Leave Environment Variables empty, then click **Deploy Web Service**. The repository's `.python-version` selects Python 3.13, and `requirements.txt` installs the CPU-only PyTorch wheel used by this service.
 4. When the deploy finishes, open the `onrender.com` URL. Check `https://YOUR-SERVICE.onrender.com/api/health` to confirm the dataset loaded.
 
 The free instance shown in Render is suitable for a first deployment, though loading PyTorch and generating SLM summaries may be slow or exceed its available memory. If logs show the process being killed or an out-of-memory error, use a larger instance or deploy without loading the SLM.
