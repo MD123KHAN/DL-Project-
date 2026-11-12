@@ -1,5 +1,11 @@
 
-const API_BASE = "http://127.0.0.1:5000";
+const IS_LOCAL_FRONTEND =
+    window.location.protocol === "file:" ||
+    (["localhost", "127.0.0.1"].includes(window.location.hostname) &&
+        window.location.port === "5500");
+const API_BASE = IS_LOCAL_FRONTEND
+    ? "http://127.0.0.1:5000"
+    : window.location.origin;
 const API_URL = `${API_BASE}/api/car`;
 const SUGGESTIONS_URL = `${API_BASE}/api/suggestions`;
 const IMAGE_URL = `${API_BASE}/api/car-image`;

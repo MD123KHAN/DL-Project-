@@ -31,6 +31,7 @@
 <summary><strong>📚 Contents</strong></summary>
 
 - [Run it locally](#run-it-locally)
+- [Deploy to Render](#deploy-to-render)
 - [How it works](#how-it-works)
 - [API quick reference](#api-quick-reference)
 - [Project layout](#project-layout)
@@ -90,6 +91,28 @@ Then open [`http://127.0.0.1:5500`](http://127.0.0.1:5500) in your browser. Keep
 </details>
 
 > **Tip:** The frontend currently points to the local API at `http://127.0.0.1:5000`. The SLM runs locally through PyTorch; comparison and vehicle search do not require a hosted LLM API key.
+
+## Deploy to Render
+
+AutoNex runs as one Render Web Service: Flask serves both the frontend and API from the same URL.
+
+1. In Render, choose **New → Web Service** and connect `MD123KHAN/DL-Project-` on the `main` branch.
+2. Use these settings:
+
+   | Render field | Value |
+   | --- | --- |
+   | Name | `autonex-ai` (or another available name) |
+   | Language | `Python 3` |
+   | Branch | `main` |
+   | Region | `Oregon (US West)` or the region you prefer |
+   | Root Directory | Leave blank |
+   | Build Command | `pip install -r requirements.txt` |
+   | Start Command | `gunicorn --chdir backend app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 180` |
+
+3. Leave Environment Variables empty, then click **Deploy Web Service**. The repository's `.python-version` selects Python 3.13.
+4. When the deploy finishes, open the `onrender.com` URL. Check `https://YOUR-SERVICE.onrender.com/api/health` to confirm the dataset loaded.
+
+The free instance shown in Render is suitable for a first deployment, though loading PyTorch and generating SLM summaries may be slow or exceed its available memory. If logs show the process being killed or an out-of-memory error, use a larger instance or deploy without loading the SLM.
 
 ## How it works
 
@@ -201,6 +224,8 @@ Image results include a source page and license information when available. Revi
 │   ├── index.html                     # App interface
 │   ├── script.js                      # UI behavior and API calls
 │   └── style.css                      # Responsive dark theme
+├── .python-version                    # Python version used by Render
+├── requirements.txt                   # Flask, pandas, PyTorch, Gunicorn
 ├── social-preview.png                 # GitHub-ready social preview
 ├── social-preview.svg                 # Editable vector alternative
 └── README.md

@@ -25,8 +25,13 @@ from slm import load_slm, generate_text
 # --------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIR = BASE_DIR.parent / "frontend"
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    static_folder=str(FRONTEND_DIR),
+    static_url_path="",
+)
 CORS(app)
 
 logging.basicConfig(level=logging.INFO)
@@ -41,11 +46,11 @@ SLM_READY = False
 SLM_ERROR = None
 
 # Local car images for fast, reliable demos
-IMAGE_DIR = BASE_DIR / "image"
+IMAGE_DIR = BASE_DIR / "image_"
 
 @app.get("/api/local-car-image/<path:filename>")
 def get_local_car_image(filename):
-    # Only serve image files from backend/image/
+    # Only serve image files from backend/image_/.
     allowed_extensions = {".jpg", ".jpeg", ".png", ".webp"}
 
     if Path(filename).name != filename:
@@ -213,6 +218,11 @@ def get_image_metadata_from_car(car):
 
 @app.get("/")
 def home():
+    return send_from_directory(FRONTEND_DIR, "index.html")
+
+
+@app.get("/api")
+def api_root():
     return jsonify({
         "application": "AutoNex-AI",
         "status": "running",
