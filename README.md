@@ -185,7 +185,7 @@ The notebook creates rule-generated target summaries from vehicle fields and spl
 
 ### Earlier from-scratch experiment
 
-The separate `AutoNex_02_SLM_From_Scratch.ipynb` notebook is an earlier retrieval-oriented experiment, not the comparison-model run above. It used 300 Wikipedia car articles (372,075 corpus characters) and a 128-character context window, with 128 embedding dimensions, 4 heads, 3 Transformer blocks, dropout 0.1, batch size 32, AdamW at 0.0003, and 600 training steps. Its recorded parameter count was about 686,376; the final recorded train and validation losses were 2.477 and 2.461. It reports no accuracy or perplexity. That notebook explicitly recommends retrieving exact specifications from the dataset rather than treating a tiny model as a source of vehicle facts.
+The separate `AutoNex_SLM_From_Scratch.ipynb` notebook is an earlier retrieval-oriented experiment, not the comparison-model run above. It used 300 Wikipedia car articles (372,075 corpus characters) and a 128-character context window, with 128 embedding dimensions, 4 heads, 3 Transformer blocks, dropout 0.1, batch size 32, AdamW at 0.0003, and 600 training steps. Its recorded parameter count was about 686,376; the final recorded train and validation losses were 2.477 and 2.461. It reports no accuracy or perplexity. That notebook explicitly recommends retrieving exact specifications from the dataset rather than treating a tiny model as a source of vehicle facts.
 
 ## API quick reference
 
