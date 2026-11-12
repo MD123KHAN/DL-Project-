@@ -33,6 +33,7 @@
 - [Run it locally](#run-it-locally)
 - [Deploy to Render](#deploy-to-render)
 - [How it works](#how-it-works)
+- [Small language model (SLM)](#small-language-model-slm)
 - [API quick reference](#api-quick-reference)
 - [Project layout](#project-layout)
 - [Data and model files](#data-and-model-files)
@@ -131,6 +132,60 @@ flowchart LR
 ```
 
 Vehicle searches use the included CSV records. For comparisons, the backend formats the selected vehicles and priority for the character-level Tiny GPT model, then uses its response only when it passes basic checks. Otherwise, it builds a short summary from the listed dataset fields.
+
+## Small language model (SLM)
+
+AutoNex uses a small, decoder-only GPT trained from scratch in PyTorch. The comparison model reads a character-level prompt containing two dataset records and a driving priority, then predicts the summary one character at a time. It uses no pretrained language model or external LLM API. Exact vehicle specifications continue to come from the CSV; generated text is supplementary and can be replaced by the dataset-based fallback.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    A[Character IDs · vocabulary 74] --> B[Token + position embeddings · 128 dimensions]
+    B --> C[3 causal Transformer blocks]
+    C --> D[Final LayerNorm + vocabulary projection]
+    D --> E[Next-character probabilities]
+    E --> F[Cross-entropy training loss]
+    C --- G[Each block: 4 attention heads + 512-wide feed-forward network]
+```
+
+Each block uses causal self-attention, a feed-forward network with a width of four times the embedding size, residual connections, LayerNorm, and dropout. The comparison model's context window is 768 characters. The output layer predicts one of the 74 characters in the training vocabulary.
+
+### Comparison model configuration and recorded results
+
+The figures below are copied from the comparison notebook's saved outputs. They describe that training run; a different checkpoint or dataset can produce different results.
+
+| Item | Recorded value |
+| --- | ---: |
+| Training data | 100,000 cleaned vehicle rows |
+| Comparison examples | 36,600 train · 4,578 validation · 4,578 test |
+| Unique make/model groups | 124 |
+| Tokenizer | Character-level · 74-character vocabulary |
+| Trainable parameters | 711,242 (about 2.71 MiB for FP32 parameters alone) |
+| Transformer | 3 decoder blocks · 4 attention heads · 128 embedding dimensions |
+| Context window | 768 characters |
+| Feed-forward width | 512 (4 × 128) |
+| Dropout | 0.1 |
+| Optimizer and learning rate | AdamW · 0.0003 |
+| Batch size | 8 on GPU · 4 on CPU |
+| Training steps / evaluation interval | 3,000 / 250 steps |
+| Training device and duration | Tesla T4 GPU · about 2.62 minutes |
+| Final training loss | 0.3779 cross-entropy |
+| Final validation loss | 0.3869 cross-entropy |
+| Final training / validation perplexity | 1.46 / 1.47 |
+
+The notebook creates rule-generated target summaries from vehicle fields and splits comparison pairs across train, validation, and test sets. The reported final metrics are for training and validation only; although a test split of 4,578 examples exists, the notebook does not report test loss or test accuracy.
+
+### How to read these metrics
+
+- **Accuracy:** not reported. This is a next-character language model, not a classification model, so the notebook does not calculate a conventional accuracy score.
+- **Loss:** cross-entropy measures how well the model predicts the next character in its training-style text. Lower is better for that prediction task, but it does not verify that a comparison is factually correct.
+- **Perplexity:** the exponential of cross-entropy loss; it summarizes next-character prediction uncertainty. It is not a factuality or user-rating score.
+- **Summary quality:** the notebook's sample generation still contains malformed text. The falling validation loss is encouraging for learning the text pattern, but the sample and missing test evaluation mean summary quality has not been established. Keep the factual dataset fallback and validate generated summaries against held-out pairs before relying on them.
+
+### Earlier from-scratch experiment
+
+The separate `AutoNex_02_SLM_From_Scratch.ipynb` notebook is an earlier retrieval-oriented experiment, not the comparison-model run above. It used 300 Wikipedia car articles (372,075 corpus characters) and a 128-character context window, with 128 embedding dimensions, 4 heads, 3 Transformer blocks, dropout 0.1, batch size 32, AdamW at 0.0003, and 600 training steps. Its recorded parameter count was about 686,376; the final recorded train and validation losses were 2.477 and 2.461. It reports no accuracy or perplexity. That notebook explicitly recommends retrieving exact specifications from the dataset rather than treating a tiny model as a source of vehicle facts.
 
 ## API quick reference
 
