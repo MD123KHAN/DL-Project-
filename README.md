@@ -202,7 +202,7 @@ Image results include a source page and license information when available. Revi
 │   ├── script.js                      # UI behavior and API calls
 │   └── style.css                      # Responsive dark theme
 ├── social-preview.png                 # GitHub-ready social preview
-├── social-preview.svg                 # Editable social preview source
+├── social-preview.svg                 # Editable vector alternative
 └── README.md
 ```
 
@@ -243,7 +243,7 @@ Confirm that `backend/model_files/autonex_tiny_gpt_checkpoint.pt` and `backend/m
 
 ## Social preview template
 
-Use the ready-to-upload [1280 × 640 PNG](social-preview.png) as the repository's social preview. Edit the [SVG source](social-preview.svg) to change the title, colors, or comparison card.
+Use the ready-to-upload [2:1 PNG](social-preview.png) as the repository's social preview; it shows the supplied Mahindra Thar Roxx and Hyundai Creta photos. The [editable SVG](social-preview.svg) is a separate vector alternative and uses simplified car illustrations.
 
 ---
 
