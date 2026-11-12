@@ -699,9 +699,7 @@ def build_slm_comparison_prompt(car1, car2, priority):
         f"Compare the following two vehicles with a focus on: '{aspect}'\n\n"
         f"{vehicle_block(car1, 'First Vehicle')}\n\n"
         f"{vehicle_block(car2, 'Second Vehicle')}\n\n"
-        f"Aspect: {aspect}\n\n"
-        "Provide an expert AutoNex AI comparison summary highlighting key differences, "
-        "trade-offs, and which vehicle is better suited for this purpose."
+        f"Aspect: {aspect}"
     )
     return f"{instruction}\n\n{user_prompt}\n\n"
 
@@ -767,22 +765,28 @@ def compare_cars():
         if SLM_READY:
             try:
                 prompt = build_slm_comparison_prompt(car1, car2, priority)
-                generated = generate_text(prompt, max_new_tokens=400, temperature=0.15)
+                generated = generate_text(prompt, max_new_tokens=180, temperature=0.15)
                 candidate = re.sub(r"\s+", " ", str(generated or "")).strip()
                 ends = list(re.finditer(r"[.!?](?=\s|$)", candidate))
-                if len(ends) >= 2:
-                    # Training answers contain two sentences; discard any drift after them.
-                    candidate = candidate[:ends[1].end()].strip()
+                if ends:
+                    # One complete SLM sentence is enough; append grounded guidance below.
+                    candidate = candidate[:ends[0].end()].strip()
                 lower_candidate = candidate.casefold()
                 names_present = all(
                     any(name.casefold() in lower_candidate for name in summary_vehicle_names(car))
                     for car in (car1, car2)
                 )
-                has_two_sentences = len(re.findall(r"[.!?](?:\s|$)", candidate)) >= 2
-                has_enough_words = len(re.findall(r"\b\w+\b", candidate)) >= 24
+                has_sentence = bool(ends)
+                has_enough_words = len(re.findall(r"\b\w+\b", candidate)) >= 14
                 looks_like_prompt = any(token in candidate.casefold() for token in ("car 1:", "car 2:", "write a concise", "json"))
-                if 120 <= len(candidate) <= 650 and names_present and has_two_sentences and has_enough_words and not looks_like_prompt:
-                    analysis = candidate
+                if 90 <= len(candidate) <= 260 and names_present and has_sentence and has_enough_words and not looks_like_prompt:
+                    fallback_sentences = re.findall(r"[^.!?]*[.!?](?:\s|$)", fallback)
+                    grounded_followup = (
+                        fallback_sentences[1].strip()
+                        if len(fallback_sentences) > 1
+                        else fallback
+                    )
+                    analysis = f"{candidate} {grounded_followup}"
                     model_used = True
             except Exception:
                 logger.exception("SLM comparison generation failed; using grounded fallback.")
@@ -794,7 +798,7 @@ def compare_cars():
             "priority": priority,
             "analysis": analysis,
             "model_used": model_used,
-            "model": "AutoNex Tiny GPT" if model_used else "Grounded dataset summary",
+            "model": "AutoNex Tiny GPT + dataset guidance" if model_used else "Grounded dataset summary",
             "notice": "Comparison uses available dataset fields. Verify vehicle specifications before purchase."
         }), 200
 

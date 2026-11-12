@@ -19,6 +19,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Tiny per-character inference is faster and more predictable on Render's
+# fractional CPU when PyTorch does not create a large thread pool per request.
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    # PyTorch only allows this setting before inter-op work has started.
+    pass
+
 
 # ---------------------------------------------------------
 # 1. Paths and configuration

@@ -306,9 +306,27 @@ def find_car(query):
     if candidates.empty:
         return None
 
+    # Narrow ordinary exact/prefix searches with vectorized string matching
+    # before the slower fuzzy scorer. This avoids scoring every row in the
+    # 100k-record dataset for common queries such as "Mahindra Thar Roxx".
+    candidate_rows = candidates
+    query_tokens = search_query.split()
+    if query_tokens:
+        mask = pd.Series(True, index=candidates.index)
+        search_text = candidates["_search_text"]
+        for token in query_tokens:
+            mask &= search_text.str.contains(
+                rf"\b{re.escape(token)}",
+                regex=True,
+                na=False,
+            )
+        narrowed = candidates.loc[mask]
+        if not narrowed.empty:
+            candidate_rows = narrowed
+
     scored = []
 
-    for index, row in candidates.iterrows():
+    for index, row in candidate_rows.iterrows():
         score = score_vehicle(search_query, row)
 
         if score > 0:
