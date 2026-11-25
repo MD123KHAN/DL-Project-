@@ -1,6 +1,7 @@
 
 from pathlib import Path
 from difflib import SequenceMatcher
+from functools import lru_cache
 import re
 
 import pandas as pd
@@ -196,15 +197,41 @@ def get_car_suggestions(query, limit=10):
 
     Returns a list of dictionaries containing name, variant and year.
     """
-    df = load_dataset()
     query = clean_query(query)
-
     if len(query) < 2:
         return []
 
-    scored = []
+    try:
+        limit = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        limit = 10
 
-    for index, row in df.iterrows():
+    return _get_car_suggestions_cached(query, limit)
+
+
+@lru_cache(maxsize=256)
+def _get_car_suggestions_cached(query, limit):
+    """Cache normalized searches and score only a narrowed candidate set."""
+    df = load_dataset()
+
+    scored = []
+    candidate_rows = df
+    query_tokens = query.split()
+    if query_tokens:
+        mask = pd.Series(True, index=df.index)
+        search_text = df["_search_text"]
+        for token in query_tokens:
+            mask &= search_text.str.contains(
+                rf"\b{re.escape(token)}",
+                regex=True,
+                na=False,
+            )
+        narrowed = df.loc[mask]
+        # Keep typo-tolerant matching when no exact/prefix candidate exists.
+        if not narrowed.empty:
+            candidate_rows = narrowed
+
+    for index, row in candidate_rows.iterrows():
         score = score_vehicle(query, row)
 
         if score > 0:
@@ -411,6 +438,15 @@ def format_car(row):
             image_url = value
             break
 
+    formatted_price = get_value("Formatted_Price")
+    if formatted_price != "Not available":
+        price_label, price_value = "Ex-showroom price", formatted_price
+    else:
+        price_label, price_value = (
+            "Ex-showroom price (INR)",
+            get_value("Ex_Showroom_Price_INR"),
+        )
+
     fields = [
         ("Manufacturer", manufacturer),
         ("Model", model),
@@ -428,13 +464,12 @@ def format_car(row):
         ("Power", get_value("Power_BHP")),
         ("City mileage", get_value("Mileage_City")),
         ("Highway mileage", get_value("Mileage_Highway")),
-        ("Ex-showroom price", get_value("Formatted_Price")),
+        (price_label, price_value),
     ]
 
     specifications = [
         {"label": label, "value": value}
         for label, value in fields
-        if value != "Not available"
     ]
 
     return {

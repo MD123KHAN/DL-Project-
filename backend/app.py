@@ -9,14 +9,19 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from io import BytesIO
 import json
 import logging
+import os
 import re
+from threading import Lock
 
 from flask import Flask, jsonify, request, send_from_directory, abort
 from flask_cors import CORS
+from PIL import Image, ImageOps, UnidentifiedImageError
+from werkzeug.exceptions import HTTPException
 
-from model import find_car, load_dataset
+from model import find_car, get_car_suggestions, load_dataset
 from slm import load_slm, generate_text
 
 
@@ -38,6 +43,26 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AutoNex-AI")
 
 app.config["JSON_SORT_KEYS"] = False
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_PIXELS = 20_000_000
+app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_BYTES * 3 + 256 * 1024
+
+# SigLIP is loaded only when a user requests image recognition. Render's
+# default instance stays protected from the model's large download and memory
+# use; a larger deployment can enable it explicitly with an environment var.
+_vision_default = "false" if os.getenv("RENDER", "").casefold() == "true" else "true"
+VISION_ENABLED = os.getenv("AUTONEX_VISION_ENABLED", _vision_default).casefold() in {
+    "1", "true", "yes", "on"
+}
+VISION_MODEL_ID = os.getenv(
+    "AUTONEX_VISION_MODEL",
+    "google/siglip-base-patch16-224",
+)
+_VISION_CLASSIFIER = None
+_VISION_ERROR = None
+_VISION_LOCK = Lock()
+_VEHICLE_IMAGE_LABELS = None
+_VEHICLE_IMAGE_LABELS_LOCK = Lock()
 
 # Set to your actual frontend origin if you want to restrict CORS.
 # Example: http://127.0.0.1:5500
@@ -99,6 +124,163 @@ def error_response(message, status_code=400, **extra):
     }
     payload.update(extra)
     return jsonify(payload), status_code
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(error):
+    """Keep API routing and method errors in the same JSON format as other API responses."""
+    if request.path == "/api" or request.path.startswith("/api/"):
+        status_code = error.code or 500
+        if status_code == 404:
+            message = (
+                "API endpoint not found. Restart the backend from this project folder "
+                "to load the current routes."
+            )
+        elif status_code == 405:
+            message = "This API endpoint does not support that request method."
+        else:
+            message = error.description or "The API request could not be completed."
+        return error_response(message, status_code)
+
+    return error
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_exception(error):
+    """Return JSON for unexpected API failures while preserving normal page errors."""
+    if request.path == "/api" or request.path.startswith("/api/"):
+        logger.exception("Unhandled API error at %s", request.path)
+        return error_response(
+            "The API could not complete this request. Check the Flask terminal for details.",
+            500,
+        )
+
+    raise error
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return error_response(
+        "The uploaded file is too large. Choose an image smaller than 8 MB.",
+        413,
+    )
+
+
+def load_vision_classifier():
+    """Load the local zero-shot image model once, on the first upload."""
+    global _VISION_CLASSIFIER, _VISION_ERROR
+
+    if _VISION_CLASSIFIER is not None:
+        return _VISION_CLASSIFIER
+
+    with _VISION_LOCK:
+        if _VISION_CLASSIFIER is not None:
+            return _VISION_CLASSIFIER
+
+        try:
+            from transformers import pipeline
+
+            _VISION_CLASSIFIER = pipeline(
+                "zero-shot-image-classification",
+                model=VISION_MODEL_ID,
+                device=-1,
+            )
+            _VISION_ERROR = None
+            return _VISION_CLASSIFIER
+        except Exception as exc:
+            _VISION_ERROR = str(exc)
+            logger.exception("Could not load the local vehicle vision model.")
+            cause = next(
+                (line.strip() for line in str(exc).splitlines() if line.strip()),
+                type(exc).__name__,
+            )
+            raise RuntimeError(
+                f"The local image-recognition model could not be loaded ({cause}). "
+                "Start Flask with the project interpreter: "
+                ".venv\\Scripts\\python.exe backend\\app.py. "
+                "If a dependency is missing, install requirements into that same .venv."
+            ) from exc
+
+
+def vehicle_image_labels():
+    """Build image labels from dataset make/model pairs, not guessed trims."""
+    global _VEHICLE_IMAGE_LABELS
+    if _VEHICLE_IMAGE_LABELS is not None:
+        return list(_VEHICLE_IMAGE_LABELS)
+
+    with _VEHICLE_IMAGE_LABELS_LOCK:
+        if _VEHICLE_IMAGE_LABELS is None:
+            df = load_dataset()
+            labels = {}
+            for make, model_name in df[["Make", "Model"]].itertuples(index=False, name=None):
+                make = str(make or "").strip()
+                model_name = str(model_name or "").strip()
+                if not make or not model_name or make.casefold() == "nan" or model_name.casefold() == "nan":
+                    continue
+                name = f"{make} {model_name}"
+                labels.setdefault(name.casefold(), name)
+            _VEHICLE_IMAGE_LABELS = tuple(sorted(labels.values(), key=str.casefold))
+
+    return list(_VEHICLE_IMAGE_LABELS)
+
+
+def vehicle_candidate_map():
+    """Create the shared vehicle/category labels used by image matching."""
+    vehicle_names = vehicle_image_labels()
+    if not vehicle_names:
+        return {}
+    candidates = {
+        f"{name} car": {"type": "vehicle", "name": name}
+        for name in vehicle_names
+    }
+    for category in (
+        "SUV", "sedan", "hatchback", "pickup truck", "coupe",
+        "convertible", "van", "wagon", "minivan", "sports car",
+    ):
+        candidates[f"{category} vehicle"] = {
+            "type": "category",
+            "name": category,
+        }
+    return candidates
+
+
+def prepare_vision_image(image):
+    """Downscale before inference; SigLIP itself resizes inputs to 224 px."""
+    image = ImageOps.exif_transpose(image)
+    image.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
+    return image.convert("RGB")
+
+
+def format_vision_predictions(ranked, candidate_map):
+    """Convert pipeline scores to the same response shape for each image."""
+    predictions = []
+    for item in sorted(
+        ranked,
+        key=lambda result: float(result.get("score", 0.0)),
+        reverse=True,
+    )[:5]:
+        candidate = candidate_map.get(item.get("label"))
+        if candidate:
+            predictions.append({
+                **candidate,
+                "score": round(float(item.get("score", 0.0)), 4),
+            })
+
+    vehicle_predictions = [item for item in predictions if item["type"] == "vehicle"]
+    best_vehicle = vehicle_predictions[0] if vehicle_predictions else None
+    top_overall = predictions[0] if predictions else None
+    uncertain = (
+        best_vehicle is None
+        or best_vehicle["score"] < 0.18
+        or top_overall is None
+        or top_overall["type"] != "vehicle"
+    )
+    return {
+        "suggested_vehicle": best_vehicle["name"] if best_vehicle else "",
+        "confidence": best_vehicle["score"] if best_vehicle else 0.0,
+        "uncertain": uncertain,
+        "predictions": predictions,
+    }
 
 
 def normalize_car_result(car):
@@ -230,9 +412,14 @@ def api_root():
         "endpoints": {
             "health": "/api/health",
             "car_search": "/api/car?q=Mahindra%20Thar",
+            "suggestions": "/api/suggestions?q=Mahindra%20Thar",
+            "vision_warmup": "/api/vision/warmup",
+            "image_recognition": "/api/recognize",
+            "image_recognition_batch": "/api/recognize/batch",
             "car_image": "/api/car-image?q=Mahindra%20Thar",
             "chat": "/api/chat",
         },
+        "vision_enabled": VISION_ENABLED,
     })
 
 
@@ -259,7 +446,30 @@ def health():
         "dataset_rows": dataset_rows,
         "slm_loaded": SLM_READY,
         "slm_error": SLM_ERROR,
+        "vision_enabled": VISION_ENABLED,
+        "vision_model_loaded": _VISION_CLASSIFIER is not None,
     }), 200 if dataset_ready else 503
+
+
+@app.get("/api/suggestions")
+def get_suggestions():
+    """Return dataset-backed make/model/variant/year autocomplete options."""
+    query = request.args.get("q", "").strip()
+    if len(query) > 150:
+        return error_response("Search query is too long.")
+
+    try:
+        limit = int(request.args.get("limit", "10"))
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 10))
+
+    try:
+        suggestions = get_car_suggestions(query, limit=limit)
+        return jsonify({"success": True, "suggestions": suggestions}), 200
+    except Exception:
+        logger.exception("Vehicle suggestions failed.")
+        return error_response("Vehicle suggestions are unavailable.", 500)
 
 
 # --------------------------------------------------
@@ -281,15 +491,12 @@ def get_car():
     try:
         query, requested_year = parse_car_query(raw_query)
 
-        # The existing model.py returns the newest matching record.
-        # If the user supplied a year, use the year-aware search
-        # implemented below when the dataset supports it.
-        car = find_car(query)
+        # Preserve an explicit year so model.py can filter candidates before
+        # choosing a matching variant. Only retry without it if necessary.
+        car = find_car(raw_query)
 
         if car is None:
-            # Retry with the complete query in case the year or trim
-            # is included in the dataset's searchable text.
-            car = find_car(raw_query)
+            car = find_car(query)
 
         if car is None:
             return error_response(
@@ -334,6 +541,163 @@ def get_car():
         logger.exception("Car search failed: %s", raw_query)
         return error_response(
             "Car search failed. Check the backend terminal.",
+            500,
+        )
+
+
+@app.post("/api/vision/warmup")
+def warmup_vehicle_vision():
+    """Load the vision model before the user asks it to classify a photo."""
+    if not VISION_ENABLED:
+        return error_response(
+            "Image recognition is disabled on this server.",
+            503,
+        )
+    try:
+        if not vehicle_candidate_map():
+            return error_response("No vehicle labels are available in the dataset.", 503)
+        load_vision_classifier()
+        return jsonify({
+            "success": True,
+            "ready": True,
+            "model": VISION_MODEL_ID,
+        }), 200
+    except RuntimeError as exc:
+        return error_response(str(exc), 503)
+
+
+@app.post("/api/recognize")
+def recognize_vehicle_image():
+    """Suggest dataset make/model labels from an image; never return specs."""
+    if not VISION_ENABLED:
+        return error_response(
+            "Image recognition is disabled on this server. Search for the vehicle by name instead.",
+            503,
+        )
+
+    upload = request.files.get("image")
+    if upload is None:
+        return error_response("Choose a vehicle image to continue.")
+    if not upload.filename:
+        return error_response("Choose a vehicle image to continue.")
+    if upload.mimetype not in {"image/jpeg", "image/png", "image/webp"}:
+        return error_response("Use a JPEG, PNG, or WebP image.", 415)
+
+    image_bytes = upload.stream.read(MAX_IMAGE_BYTES + 1)
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        return error_response("Choose an image smaller than 8 MB.", 413)
+    if not image_bytes:
+        return error_response("The selected image is empty.")
+
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        if image.format not in {"JPEG", "PNG", "WEBP"}:
+            return error_response("Use a JPEG, PNG, or WebP image.", 415)
+        if image.width * image.height > MAX_IMAGE_PIXELS:
+            return error_response("Choose an image with 20 megapixels or fewer.", 413)
+        image.load()
+        image = prepare_vision_image(image)
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
+        return error_response("The selected file is not a readable image.")
+
+    try:
+        candidate_map = vehicle_candidate_map()
+        if not candidate_map:
+            return error_response("No vehicle labels are available in the dataset.", 503)
+
+        classifier = load_vision_classifier()
+        ranked = classifier(image, candidate_labels=list(candidate_map))
+        result = format_vision_predictions(ranked, candidate_map)
+
+        return jsonify({
+            "success": True,
+            "model": VISION_MODEL_ID,
+            **result,
+            "notice": (
+                "These are relative image-match scores, not verified identity. "
+                "Confirm or correct the vehicle before loading dataset specifications. "
+                "A photo cannot reveal year, trim, price, mileage, engine power, or other specifications."
+            ),
+        }), 200
+    except RuntimeError as exc:
+        return error_response(str(exc), 503)
+    except Exception:
+        logger.exception("Vehicle image recognition failed.")
+        return error_response(
+            "Image recognition failed. You can still search for the vehicle by name.",
+            500,
+        )
+
+
+@app.post("/api/recognize/batch")
+def recognize_vehicle_images_batch():
+    """Recognize exactly three uploaded images in one model batch."""
+    if not VISION_ENABLED:
+        return error_response(
+            "Image recognition is disabled on this server.",
+            503,
+        )
+
+    uploads = request.files.getlist("images")
+    if len(uploads) != 3:
+        return error_response("Upload exactly three car photos to compare them together.")
+
+    images = []
+    for upload in uploads:
+        if not upload or not upload.filename:
+            return error_response("Choose a photo for each of the three cars.")
+        if upload.mimetype not in {"image/jpeg", "image/png", "image/webp"}:
+            return error_response("Use JPEG, PNG, or WebP images for all three cars.", 415)
+
+        image_bytes = upload.stream.read(MAX_IMAGE_BYTES + 1)
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            return error_response("Each image must be smaller than 8 MB.", 413)
+        if not image_bytes:
+            return error_response("One of the selected images is empty.")
+
+        try:
+            image = Image.open(BytesIO(image_bytes))
+            if image.format not in {"JPEG", "PNG", "WEBP"}:
+                return error_response("Use JPEG, PNG, or WebP images for all three cars.", 415)
+            if image.width * image.height > MAX_IMAGE_PIXELS:
+                return error_response("Each image must have 20 megapixels or fewer.", 413)
+            image.load()
+            images.append(prepare_vision_image(image))
+        except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
+            return error_response("One of the selected files is not a readable image.")
+
+    try:
+        candidate_map = vehicle_candidate_map()
+        if not candidate_map:
+            return error_response("No vehicle labels are available in the dataset.", 503)
+
+        classifier = load_vision_classifier()
+        ranked_batch = classifier(
+            images,
+            candidate_labels=list(candidate_map),
+            batch_size=3,
+        )
+        if len(ranked_batch) != 3:
+            raise RuntimeError("The vision model did not return one result per photo.")
+
+        return jsonify({
+            "success": True,
+            "model": VISION_MODEL_ID,
+            "results": [
+                format_vision_predictions(ranked, candidate_map)
+                for ranked in ranked_batch
+            ],
+            "notice": (
+                "Scores are relative image matches, not verified identity. "
+                "Confirm each vehicle and dataset variant before comparing specifications."
+            ),
+        }), 200
+    except RuntimeError as exc:
+        return error_response(str(exc), 503)
+    except Exception:
+        logger.exception("Three-photo vehicle recognition failed.")
+        return error_response(
+            "Three-photo recognition failed. Check the Flask terminal.",
             500,
         )
 
@@ -571,86 +935,220 @@ def _spec(specs, *keys):
     return "Not available"
 
 
-def build_comparison_summary(car1, car2, priority):
-    """Produce a short, grounded 2–3 sentence comparison from dataset facts."""
-    s1, s2 = car1["specifications"], car2["specifications"]
-    n1, n2 = car1["name"], car2["name"]
-
-    price1 = _spec(s1, "Formatted_Price", "Ex_Showroom_Price_INR", "Price", "price")
-    price2 = _spec(s2, "Formatted_Price", "Ex_Showroom_Price_INR", "Price", "price")
-    power1 = _spec(s1, "Power_BHP", "Power", "BHP", "Horsepower")
-    power2 = _spec(s2, "Power_BHP", "Power", "BHP", "Horsepower")
-    mileage1 = _spec(s1, "Mileage_City", "City mileage", "City_Mileage")
-    mileage2 = _spec(s2, "Mileage_City", "City mileage", "City_Mileage")
-    highway1 = _spec(s1, "Mileage_Highway", "Highway mileage", "Highway_Mileage")
-    highway2 = _spec(s2, "Mileage_Highway", "Highway mileage", "Highway_Mileage")
-    seats1 = _spec(s1, "Seating_Capacity", "Seating capacity", "Seats")
-    seats2 = _spec(s2, "Seating_Capacity", "Seating capacity", "Seats")
-    drive1 = _spec(s1, "Drivetrain", "Drive_Type", "Drive")
-    drive2 = _spec(s2, "Drivetrain", "Drive_Type", "Drive")
-    trans1 = _spec(s1, "Transmission", "Transmission_Type")
-    trans2 = _spec(s2, "Transmission", "Transmission_Type")
-    body1 = _spec(s1, "Body_Style", "Body style", "Body_Type")
-    body2 = _spec(s2, "Body_Style", "Body style", "Body_Type")
-    fuel1 = _spec(s1, "Fuel_Type", "Fuel type")
-    fuel2 = _spec(s2, "Fuel_Type", "Fuel type")
-
-    priority = str(priority or "family").casefold()
-    if priority in {"performance", "engine", "engine and performance"}:
-        if _number(power1) is not None and _number(power2) is not None:
-            delta = abs(_number(power1) - _number(power2))
-            stronger = n1 if _number(power1) > _number(power2) else n2 if _number(power2) > _number(power1) else None
-            first = (f"{stronger} has the higher listed output ({power1} vs {power2} BHP)." if stronger else f"Both list the same power output ({power1} BHP).")
-        else:
-            first = f"Listed power is {power1} for {n1} and {power2} for {n2}; the dataset does not provide enough numeric information to rank performance confidently."
-        second = f"Transmission: {trans1} vs {trans2}; drivetrain: {drive1} vs {drive2}."
-    elif priority in {"city", "city driving"}:
-        if _number(mileage1) is not None and _number(mileage2) is not None:
-            better = n1 if _number(mileage1) > _number(mileage2) else n2 if _number(mileage2) > _number(mileage1) else None
-            first = (f"{better} has the higher listed city mileage ({mileage1} vs {mileage2})." if better else f"Both list the same city mileage ({mileage1}).")
-        else:
-            first = f"City mileage is {mileage1} for {n1} and {mileage2} for {n2}; the available data does not establish a clear economy winner."
-        second = f"Transmission: {trans1} vs {trans2}; compare dimensions and parking needs as well before choosing for city use."
-    elif priority in {"highway", "highway trips"}:
-        if _number(highway1) is not None and _number(highway2) is not None:
-            better = n1 if _number(highway1) > _number(highway2) else n2 if _number(highway2) > _number(highway1) else None
-            first = (f"{better} has the higher listed highway mileage ({highway1} vs {highway2})." if better else f"Both list the same highway mileage ({highway1}).")
-        else:
-            first = f"Highway mileage is {highway1} for {n1} and {highway2} for {n2}; highway economy cannot be ranked confidently from these records."
-        second = f"Power is {power1} vs {power2}; use a test drive to assess high-speed comfort and stability, which these figures alone cannot confirm."
-    elif priority in {"offroad", "off-road", "off-road driving"}:
-        capable1 = any(x in drive1.casefold() for x in ("4wd", "4x4", "awd", "4-wheel", "four wheel"))
-        capable2 = any(x in drive2.casefold() for x in ("4wd", "4x4", "awd", "4-wheel", "four wheel"))
-        if capable1 and not capable2:
-            first = f"{n1} is listed with {drive1}, while {n2} is listed with {drive2}; that gives {n1} the stronger drivetrain specification for off-road use."
-        elif capable2 and not capable1:
-            first = f"{n2} is listed with {drive2}, while {n1} is listed with {drive1}; that gives {n2} the stronger drivetrain specification for off-road use."
-        elif capable1 and capable2:
-            first = f"Both vehicles list AWD/4WD-type drivetrains ({drive1} vs {drive2}); the dataset alone does not establish which has better ground clearance, approach angles or off-road hardware."
-        else:
-            first = f"The dataset lists {drive1} for {n1} and {drive2} for {n2}; neither record clearly confirms AWD/4WD, so do not assume either is suited to demanding trails."
-        second = f"Both are listed as {body1} and {body2} respectively; verify ground clearance, tyres and off-road equipment before driving on difficult terrain."
-    elif priority in {"economy", "fuel economy", "fuel economy and running costs", "cost"}:
-        pnum1, pnum2 = _number(price1), _number(price2)
-        if pnum1 is not None and pnum2 is not None:
-            cheaper = n1 if pnum1 < pnum2 else n2 if pnum2 < pnum1 else None
-            first = (f"{cheaper} has the lower listed price ({price1} vs {price2})." if cheaper else f"Both list the same price ({price1}).")
-        else:
-            first = f"Listed prices are {price1} for {n1} and {price2} for {n2}; a price winner cannot be confirmed from the available values."
-        second = f"City mileage is {mileage1} vs {mileage2}; fuel types are {fuel1} vs {fuel2}. Actual running costs depend on local fuel prices and driving conditions."
-    else:  # family / comfort
-        if _number(seats1) is not None and _number(seats2) is not None:
-            first = f"Seating is listed as {seats1} for {n1} and {seats2} for {n2}; body styles are {body1} and {body2}."
-        else:
-            first = f"Body styles are listed as {body1} for {n1} and {body2} for {n2}; seating data is {seats1} vs {seats2}."
-        second = f"For family use, compare rear-seat space, child-seat fit, boot capacity and safety equipment in person; these records alone do not prove overall comfort."
-
-    return f"{first} {second}"
+def _measurement_unit(value):
+    """Return the unit text after a leading numeric measurement, if present."""
+    match = re.match(r"^\s*-?\d[\d,]*(?:\.\d+)?\s*(.*?)\s*$", str(value or ""))
+    return re.sub(r"[^a-z%]+", "", match.group(1).casefold()) if match else ""
 
 
-def build_slm_comparison_prompt(car1, car2, priority):
-    """Format comparison facts like the SLM's training examples."""
-    aspect_by_priority = {
+def _compare_numeric(first, second, *, higher_is_better=True, compare_units=False):
+    """Compare two displayed numeric values, returning first/second/tie/unknown."""
+    value1, value2 = _number(first), _number(second)
+    if value1 is None or value2 is None:
+        return "unknown"
+    if compare_units and _measurement_unit(first) != _measurement_unit(second):
+        return "incomparable"
+    if value1 == value2:
+        return "tie"
+    first_better = value1 > value2 if higher_is_better else value1 < value2
+    return "first" if first_better else "second"
+
+
+def build_five_basis_comparison(car1, car2, priority):
+    """Build five explicit, deterministic comparisons from the selected records."""
+    specs1, specs2 = car1["specifications"], car2["specifications"]
+    name1, name2 = car1["name"], car2["name"]
+
+    def unavailable(value):
+        return value == "Not available"
+
+    def make_basis(label, result, summary, value1, value2):
+        return {
+            "label": label,
+            "result": result,
+            "summary": summary,
+            "car1_value": value1,
+            "car2_value": value2,
+        }
+
+    # 1. Affordability: compare canonical INR values, not rounded lakh strings.
+    price1 = _spec(specs1, "Formatted_Price", "Ex_Showroom_Price_INR", "Price")
+    price2 = _spec(specs2, "Formatted_Price", "Ex_Showroom_Price_INR", "Price")
+    price_inr1 = _spec(specs1, "Ex_Showroom_Price_INR", "Price_INR")
+    price_inr2 = _spec(specs2, "Ex_Showroom_Price_INR", "Price_INR")
+    price_result = _compare_numeric(price_inr1, price_inr2, higher_is_better=False)
+    if price_result == "first":
+        price_verdict = "car1"
+        price_summary = f"{name1} has the lower listed ex-showroom price. This does not include insurance, taxes, or ownership costs."
+    elif price_result == "second":
+        price_verdict = "car2"
+        price_summary = f"{name2} has the lower listed ex-showroom price. This does not include insurance, taxes, or ownership costs."
+    elif price_result == "tie":
+        price_verdict = "tie"
+        price_summary = "Both selected records list the same ex-showroom price."
+    else:
+        price_verdict = "incomplete"
+        price_summary = "A price advantage cannot be determined because a comparable numeric price is missing."
+    price_basis = make_basis("Price & affordability", price_verdict, price_summary, price1, price2)
+
+    # 2. Economy: compare city/highway mileage only when fuels and units match.
+    city1 = _spec(specs1, "Mileage_City", "City mileage", "City_Mileage")
+    city2 = _spec(specs2, "Mileage_City", "City mileage", "City_Mileage")
+    highway1 = _spec(specs1, "Mileage_Highway", "Highway mileage", "Highway_Mileage")
+    highway2 = _spec(specs2, "Mileage_Highway", "Highway mileage", "Highway_Mileage")
+    fuel1 = _spec(specs1, "Fuel_Type", "Fuel type")
+    fuel2 = _spec(specs2, "Fuel_Type", "Fuel type")
+    same_fuel = not unavailable(fuel1) and not unavailable(fuel2) and fuel1.casefold() == fuel2.casefold()
+    priority_key = str(priority or "family").casefold()
+    if priority_key in {"city", "city driving"}:
+        economy_metrics = [("City", city1, city2)]
+    elif priority_key in {"highway", "highway trips"}:
+        economy_metrics = [("Highway", highway1, highway2)]
+    else:
+        economy_metrics = [("City", city1, city2), ("Highway", highway1, highway2)]
+
+    economy_outcomes = []
+    economy_notes = []
+    for metric_name, metric1, metric2 in economy_metrics:
+        if unavailable(metric1) or unavailable(metric2):
+            economy_outcomes.append("unknown")
+            economy_notes.append(f"{metric_name.lower()} mileage is missing for at least one vehicle")
+            continue
+        if not same_fuel:
+            economy_outcomes.append("incomparable")
+            economy_notes.append(f"{metric_name.lower()} values are shown, but fuel types differ or are unavailable")
+            continue
+        outcome = _compare_numeric(metric1, metric2, compare_units=True)
+        economy_outcomes.append(outcome)
+        if outcome == "first":
+            economy_notes.append(f"{name1} has the higher listed {metric_name.lower()} mileage ({metric1} vs {metric2})")
+        elif outcome == "second":
+            economy_notes.append(f"{name2} has the higher listed {metric_name.lower()} mileage ({metric2} vs {metric1})")
+        elif outcome == "tie":
+            economy_notes.append(f"both list the same {metric_name.lower()} mileage ({metric1})")
+        else:
+            economy_notes.append(f"{metric_name.lower()} mileage units do not match, so the figures are not directly comparable")
+
+    comparable_economy = [item for item in economy_outcomes if item in {"first", "second", "tie"}]
+    directions = set(comparable_economy) - {"tie"}
+    if not comparable_economy:
+        economy_verdict = "incomparable" if "incomparable" in economy_outcomes else "incomplete"
+    elif not directions:
+        economy_verdict = "tie" if len(comparable_economy) == len(economy_outcomes) else "partial_tie"
+    elif directions == {"first"}:
+        economy_verdict = "car1" if len(comparable_economy) == len(economy_outcomes) else "partial_car1"
+    elif directions == {"second"}:
+        economy_verdict = "car2" if len(comparable_economy) == len(economy_outcomes) else "partial_car2"
+    else:
+        economy_verdict = "mixed"
+    economy_summary = "; ".join(economy_notes)
+    if economy_summary:
+        economy_summary = economy_summary[0].upper() + economy_summary[1:] + "."
+    economy_basis = make_basis(
+        "Fuel economy",
+        economy_verdict,
+        economy_summary,
+        f"City: {city1} · Highway: {highway1} · Fuel: {fuel1}",
+        f"City: {city2} · Highway: {highway2} · Fuel: {fuel2}",
+    )
+
+    # 3. Performance: power is the ranking field; other engine fields are context.
+    power1 = _spec(specs1, "Power_BHP", "Power", "BHP", "Horsepower")
+    power2 = _spec(specs2, "Power_BHP", "Power", "BHP", "Horsepower")
+    displacement1 = _spec(specs1, "Displacement", "Engine_CC", "Engine_Displacement")
+    displacement2 = _spec(specs2, "Displacement", "Engine_CC", "Engine_Displacement")
+    cylinders1 = _spec(specs1, "Cylinders", "Cylinder_Count")
+    cylinders2 = _spec(specs2, "Cylinders", "Cylinder_Count")
+    performance_result = _compare_numeric(power1, power2)
+    if performance_result == "first":
+        performance_verdict = "car1"
+        performance_summary = f"{name1} has higher listed power ({power1} BHP vs {power2} BHP). Power alone does not establish acceleration or handling."
+    elif performance_result == "second":
+        performance_verdict = "car2"
+        performance_summary = f"{name2} has higher listed power ({power2} BHP vs {power1} BHP). Power alone does not establish acceleration or handling."
+    elif performance_result == "tie":
+        performance_verdict = "tie"
+        performance_summary = f"Both records list {power1} BHP. Engine displacement and cylinders are shown for context, not used to declare an overall winner."
+    else:
+        performance_verdict = "incomplete"
+        performance_summary = "A power comparison is unavailable because one or both records lack a numeric power value."
+    performance_basis = make_basis(
+        "Power & engine",
+        performance_verdict,
+        performance_summary,
+        f"Power: {power1} BHP · Engine: {displacement1} · Cylinders: {cylinders1}",
+        f"Power: {power2} BHP · Engine: {displacement2} · Cylinders: {cylinders2}",
+    )
+
+    # 4. Practicality: seat count is descriptive; more seats are not a comfort score.
+    seats1 = _spec(specs1, "Seating_Capacity", "Seating capacity", "Seats")
+    seats2 = _spec(specs2, "Seating_Capacity", "Seating capacity", "Seats")
+    body1 = _spec(specs1, "Body_Style", "Body style", "Body_Type")
+    body2 = _spec(specs2, "Body_Style", "Body style", "Body_Type")
+    doors1 = _spec(specs1, "Doors", "Door_Count")
+    doors2 = _spec(specs2, "Doors", "Door_Count")
+    seat_result = _compare_numeric(seats1, seats2)
+    if seat_result == "first":
+        practicality_verdict = "car1"
+        practicality_summary = f"{name1} has more listed seats ({seats1} vs {seats2}); this measures capacity, not passenger comfort."
+    elif seat_result == "second":
+        practicality_verdict = "car2"
+        practicality_summary = f"{name2} has more listed seats ({seats2} vs {seats1}); this measures capacity, not passenger comfort."
+    elif seat_result == "tie":
+        practicality_verdict = "tie"
+        practicality_summary = f"Both list {seats1} seats. Body style and door count are shown for layout context; cabin dimensions and boot space are not in these records."
+    else:
+        practicality_verdict = "incomplete"
+        practicality_summary = "Seating capacity is missing, so this category cannot be ranked. Body style and door count remain available as descriptive details."
+    practicality_basis = make_basis(
+        "Space & practicality",
+        practicality_verdict,
+        practicality_summary,
+        f"Seats: {seats1} · Body: {body1} · Doors: {doors1}",
+        f"Seats: {seats2} · Body: {body2} · Doors: {doors2}",
+    )
+
+    # 5. Capability and controls: only make a directional claim for off-road priority.
+    drivetrain1 = _spec(specs1, "Drivetrain", "Drive_Type", "Drive")
+    drivetrain2 = _spec(specs2, "Drivetrain", "Drive_Type", "Drive")
+    transmission1 = _spec(specs1, "Transmission", "Transmission_Type")
+    transmission2 = _spec(specs2, "Transmission", "Transmission_Type")
+    has_4wd1 = any(token in drivetrain1.casefold() for token in ("4wd", "4x4", "awd", "4-wheel", "four wheel"))
+    has_4wd2 = any(token in drivetrain2.casefold() for token in ("4wd", "4x4", "awd", "4-wheel", "four wheel"))
+    is_offroad = priority_key in {"offroad", "off-road", "off-road driving"}
+    if is_offroad and has_4wd1 != has_4wd2:
+        capability_verdict = "car1" if has_4wd1 else "car2"
+        better_name = name1 if has_4wd1 else name2
+        capability_summary = f"{better_name} has the listed AWD/4WD drivetrain advantage for off-road use. Ground clearance, tyres, low-range gearing, and off-road equipment are not established by these fields."
+    elif is_offroad and has_4wd1 and has_4wd2:
+        capability_verdict = "shared"
+        capability_summary = "Both records list AWD/4WD. These records do not distinguish ground clearance, tyres, low-range gearing, or other off-road equipment."
+    elif is_offroad:
+        capability_verdict = "incomplete"
+        capability_summary = "Neither record clearly lists AWD/4WD; off-road suitability cannot be determined from drivetrain alone."
+    elif drivetrain1 == drivetrain2 and transmission1 == transmission2:
+        capability_verdict = "tie"
+        capability_summary = "Both records list the same drivetrain and transmission. This category does not distinguish the vehicles for the selected priority."
+    else:
+        capability_verdict = "preference"
+        capability_summary = "The listed drivetrain and transmission differ; which setup suits you depends on your driving conditions and preference."
+    capability_basis = make_basis(
+        "Drivetrain & transmission",
+        capability_verdict,
+        capability_summary,
+        f"{drivetrain1} · {transmission1}",
+        f"{drivetrain2} · {transmission2}",
+    )
+
+    return [price_basis, economy_basis, performance_basis, practicality_basis, capability_basis]
+
+
+def build_priority_comparison(car1, car2, basis, priority):
+    """Return one clear, data-backed result for the user's selected priority."""
+    specs1, specs2 = car1["specifications"], car2["specifications"]
+    name1, name2 = car1["name"], car2["name"]
+    priority_key = str(priority or "family").casefold()
+    priority_labels = {
         "family": "Family use and comfort",
         "city": "City driving",
         "highway": "Highway trips",
@@ -658,64 +1156,153 @@ def build_slm_comparison_prompt(car1, car2, priority):
         "economy": "Fuel economy and running costs",
         "performance": "Engine and performance",
     }
-    aspect = aspect_by_priority.get(str(priority or "family").casefold(), "Family use and comfort")
-    instruction = (
-        "You are AutoNex AI, an expert automotive consultant. Compare the two provided vehicles "
-        "specifically focusing on the requested aspect and produce a clear, objective, and "
-        "insightful summary explaining which car is better suited and why."
-    )
+    focus_by_priority = {
+        "family": "Space & practicality",
+        "city": "Fuel economy",
+        "highway": "Fuel economy",
+        "offroad": "Drivetrain & transmission",
+        "economy": "Fuel economy",
+        "performance": "Power & engine",
+    }
+    priority_label = priority_labels.get(priority_key, "your selected priority")
+    focus_label = focus_by_priority.get(priority_key, "Space & practicality")
+    selected = next(item for item in basis if item["label"] == focus_label).copy()
 
-    def vehicle_block(car, label):
-        specs = car["specifications"]
-        make = _spec(specs, "Make")
-        model = _spec(specs, "Model")
-        variant = _spec(specs, "Trim_Variant", "Variant")
-        base_name = " ".join(part for part in (make, model) if part != "Not available")
-        display_name = base_name or car["name"]
-        if variant != "Not available":
-            display_name = f"{display_name} ({variant})"
+    def verdict_for(result):
+        if result == "car1":
+            return name1
+        if result == "car2":
+            return name2
+        return None
 
-        price = _spec(specs, "Formatted_Price", "Ex_Showroom_Price_INR", "Price")
-        displacement = _spec(specs, "Displacement", "Engine_CC", "Engine_Displacement")
-        power = _spec(specs, "Power_BHP", "Power", "BHP", "Horsepower")
-        body = _spec(specs, "Body_Style", "Body style", "Body_Type")
-        seats = _spec(specs, "Seating_Capacity", "Seating capacity", "Seats")
-        transmission = _spec(specs, "Transmission", "Transmission_Type")
-        drivetrain = _spec(specs, "Drivetrain", "Drive_Type", "Drive")
-        fuel = _spec(specs, "Fuel_Type", "Fuel type")
-        city = _spec(specs, "Mileage_City", "City mileage", "City_Mileage")
-        highway = _spec(specs, "Mileage_Highway", "Highway mileage", "Highway_Mileage")
+    if priority_key in {"city", "highway"}:
+        metric = "City" if priority_key == "city" else "Highway"
+        field = "Mileage_City" if priority_key == "city" else "Mileage_Highway"
+        value1 = _spec(specs1, field, f"{metric} mileage", f"{metric}_Mileage")
+        value2 = _spec(specs2, field, f"{metric} mileage", f"{metric}_Mileage")
+        fuel1 = _spec(specs1, "Fuel_Type", "Fuel type")
+        fuel2 = _spec(specs2, "Fuel_Type", "Fuel type")
+        same_fuel = fuel1 != "Not available" and fuel2 != "Not available" and fuel1.casefold() == fuel2.casefold()
+        selected["label"] = f"{metric} fuel economy"
+        selected["car1_value"], selected["car2_value"] = value1, value2
+        if not same_fuel:
+            selected["result"] = "incomparable"
+            selected["summary"] = f"{metric} mileage cannot fairly decide this priority because the fuel types differ or are missing ({fuel1} vs {fuel2})."
+        else:
+            outcome = _compare_numeric(value1, value2, compare_units=True)
+            selected["result"] = {"first": "car1", "second": "car2", "tie": "tie"}.get(outcome, "incomplete")
+            if outcome == "first":
+                selected["summary"] = f"{name1} is the better match for {priority_label.lower()} on the listed {metric.lower()} mileage ({value1} vs {value2}); both records list {fuel1}."
+            elif outcome == "second":
+                selected["summary"] = f"{name2} is the better match for {priority_label.lower()} on the listed {metric.lower()} mileage ({value2} vs {value1}); both records list {fuel1}."
+            elif outcome == "tie":
+                selected["summary"] = f"Neither car wins for {priority_label.lower()}: both list {value1} {metric.lower()} mileage and the same fuel type ({fuel1})."
+            elif outcome == "incomparable":
+                selected["summary"] = f"No winner for {priority_label.lower()}: the mileage units differ ({value1} vs {value2}), so the figures are not directly comparable."
+            else:
+                selected["summary"] = f"No winner for {priority_label.lower()}: a comparable numeric {metric.lower()} mileage value is missing."
 
-        return (
-            f"[{label}]\n"
-            f"Vehicle: {display_name}\n"
-            f"- Price: {price}\n"
-            f"- Body & Seats: {body}, {seats} Seater\n"
-            f"- Powertrain: {displacement}, {power} BHP, {transmission}, {drivetrain}\n"
-            f"- Fuel & Mileage: {fuel} | City: {city} | Highway: {highway}"
-        )
+    elif priority_key == "economy":
+        price = next(item for item in basis if item["label"] == "Price & affordability")
+        mileage = next(item for item in basis if item["label"] == "Fuel economy")
+        price_result, mileage_result = price["result"], mileage["result"]
+        decisive = {"car1", "car2", "tie"}
+        if mileage_result == "mixed":
+            result = "mixed"
+        elif price_result in decisive and mileage_result in decisive:
+            edges = {result for result in (price_result, mileage_result) if result != "tie"}
+            result = next(iter(edges)) if len(edges) == 1 else ("tie" if not edges else "mixed")
+        else:
+            result = "incomplete"
+        selected.update({
+            "label": "Fuel economy and running costs",
+            "result": result,
+            "car1_value": f"Price: {price['car1_value']} · {mileage['car1_value']}",
+            "car2_value": f"Price: {price['car2_value']} · {mileage['car2_value']}",
+        })
+        if result in {"car1", "car2"}:
+            winner = name1 if result == "car1" else name2
+            winning_edges = []
+            if price_result == result:
+                winning_edges.append(price["summary"])
+            if mileage_result == result:
+                winning_edges.append(mileage["summary"])
+            selected["summary"] = f"{winner} is the stronger match for fuel economy and running costs. " + " ".join(winning_edges) + " These figures compare listed price and mileage; actual running cost also depends on fuel price, annual distance, and local taxes."
+        elif result == "tie":
+            selected["summary"] = f"No winner for fuel economy and running costs: both records tie on listed ex-showroom price and comparable mileage. Actual ownership cost can still differ with fuel price, annual distance, insurance, and taxes."
+        elif result == "mixed":
+            selected["summary"] = f"There is no single winner for fuel economy and running costs because the listed figures point in different directions. {price['summary']} {mileage['summary']} Actual total cost depends on expected annual distance and fuel prices."
+        else:
+            selected["summary"] = f"No reliable winner for fuel economy and running costs: price or comparable mileage data is missing or uses incompatible fuel types. {price['summary']} {mileage['summary']}"
 
-    user_prompt = (
-        f"Compare the following two vehicles with a focus on: '{aspect}'\n\n"
-        f"{vehicle_block(car1, 'First Vehicle')}\n\n"
-        f"{vehicle_block(car2, 'Second Vehicle')}\n\n"
-        f"Aspect: {aspect}"
-    )
-    return f"{instruction}\n\n{user_prompt}\n\n"
+    elif priority_key == "family":
+        seats1 = _spec(specs1, "Seating_Capacity", "Seating capacity", "Seats")
+        seats2 = _spec(specs2, "Seating_Capacity", "Seating capacity", "Seats")
+        selected["car1_value"], selected["car2_value"] = f"{seats1} seats", f"{seats2} seats"
+        result = selected["result"]
+        if result in {"car1", "car2"}:
+            winner = verdict_for(result)
+            winner_seats = seats1 if result == "car1" else seats2
+            other_seats = seats2 if result == "car1" else seats1
+            selected["summary"] = f"{winner} is the better match for family capacity, with {winner_seats} listed seats versus {other_seats}. Seat count measures capacity only; comfort, child-seat fit, and boot space are not available in these records."
+        elif result == "tie":
+            selected["summary"] = f"Neither car wins on listed family capacity: both have {seats1} seats. The records do not establish comfort, child-seat fit, or boot space."
 
+    elif priority_key == "performance":
+        power1 = _spec(specs1, "Power_BHP", "Power", "BHP", "Horsepower")
+        power2 = _spec(specs2, "Power_BHP", "Power", "BHP", "Horsepower")
+        selected["car1_value"], selected["car2_value"] = f"{power1} BHP", f"{power2} BHP"
+        result = selected["result"]
+        if result in {"car1", "car2"}:
+            winner = verdict_for(result)
+            winner_power = power1 if result == "car1" else power2
+            other_power = power2 if result == "car1" else power1
+            selected["summary"] = f"{winner} leads on the listed power figure ({winner_power} BHP vs {other_power} BHP), so it is the specification winner for engine and performance. Power alone does not establish acceleration, handling, or real-world performance."
 
-def summary_vehicle_names(car):
-    """Return the model name the SLM uses, plus its full display name."""
-    specs = car["specifications"]
-    make = _spec(specs, "Make")
-    model = _spec(specs, "Model")
-    base_name = " ".join(part for part in (make, model) if part != "Not available")
-    return [name for name in (base_name, car["name"]) if name]
+    result = selected["result"]
+    winner = verdict_for(result)
+    if winner:
+        if priority_key == "family":
+            winner_value = selected["car1_value"] if result == "car1" else selected["car2_value"]
+            other_value = selected["car2_value"] if result == "car1" else selected["car1_value"]
+            headline = f"More listed seats: {winner} ({winner_value} vs {other_value})"
+        elif priority_key in {"city", "highway"}:
+            winner_value = selected["car1_value"] if result == "car1" else selected["car2_value"]
+            other_value = selected["car2_value"] if result == "car1" else selected["car1_value"]
+            headline = f"Mileage winner for {priority_label.lower()}: {winner} ({winner_value} vs {other_value})"
+        elif priority_key == "performance":
+            winner_value = selected["car1_value"] if result == "car1" else selected["car2_value"]
+            other_value = selected["car2_value"] if result == "car1" else selected["car1_value"]
+            headline = f"Performance specification winner: {winner} ({winner_value} vs {other_value})"
+        elif priority_key == "offroad":
+            headline = f"Stronger listed off-road drivetrain: {winner}"
+        elif priority_key == "economy":
+            headline = f"Stronger listed value for {priority_label.lower()}: {winner}"
+        else:
+            headline = f"Winner for {priority_label}: {winner}"
+    elif result == "tie":
+        headline = f"No winner for {priority_label}: the listed figures are tied"
+    elif result == "shared":
+        headline = f"No winner for {priority_label}: both records list the same drivetrain capability"
+    elif result == "mixed":
+        headline = f"No single winner for {priority_label}: the results are split"
+    elif result == "preference":
+        headline = f"No single winner for {priority_label}: the listed setups suit different preferences"
+    elif result == "incomparable":
+        headline = f"No winner for {priority_label}: the listed figures are not directly comparable"
+    else:
+        headline = f"No clear winner for {priority_label}: the available data is insufficient"
+
+    selected["priority"] = priority_key
+    selected["priority_label"] = priority_label
+    selected["winner"] = winner
+    selected["headline"] = headline
+    return selected
 
 
 @app.route("/api/compare", methods=["POST"])
 def compare_cars():
-    """Compare two dataset records and use the SLM only if its output is usable."""
+    """Compare two selected records on the user's chosen priority."""
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return error_response("Send a valid JSON request.")
@@ -756,50 +1343,23 @@ def compare_cars():
         if not car1 or not car2:
             return jsonify({"success": False, "error": "Could not normalize one or both vehicle records."}), 500
 
-        fallback = build_comparison_summary(car1, car2, priority)
-        analysis = fallback
-        model_used = False
-
-        # This character-level model was trained on instruction + vehicle facts,
-        # so mirror that format and allow enough characters for its two-sentence answers.
-        if SLM_READY:
-            try:
-                prompt = build_slm_comparison_prompt(car1, car2, priority)
-                generated = generate_text(prompt, max_new_tokens=180, temperature=0.15)
-                candidate = re.sub(r"\s+", " ", str(generated or "")).strip()
-                ends = list(re.finditer(r"[.!?](?=\s|$)", candidate))
-                if ends:
-                    # One complete SLM sentence is enough; append grounded guidance below.
-                    candidate = candidate[:ends[0].end()].strip()
-                lower_candidate = candidate.casefold()
-                names_present = all(
-                    any(name.casefold() in lower_candidate for name in summary_vehicle_names(car))
-                    for car in (car1, car2)
-                )
-                has_sentence = bool(ends)
-                has_enough_words = len(re.findall(r"\b\w+\b", candidate)) >= 14
-                looks_like_prompt = any(token in candidate.casefold() for token in ("car 1:", "car 2:", "write a concise", "json"))
-                if 90 <= len(candidate) <= 260 and names_present and has_sentence and has_enough_words and not looks_like_prompt:
-                    fallback_sentences = re.findall(r"[^.!?]*[.!?](?:\s|$)", fallback)
-                    grounded_followup = (
-                        fallback_sentences[1].strip()
-                        if len(fallback_sentences) > 1
-                        else fallback
-                    )
-                    analysis = f"{candidate} {grounded_followup}"
-                    model_used = True
-            except Exception:
-                logger.exception("SLM comparison generation failed; using grounded fallback.")
+        all_basis = build_five_basis_comparison(car1, car2, priority)
+        priority_result = build_priority_comparison(car1, car2, all_basis, priority)
+        analysis = priority_result["summary"]
 
         return jsonify({
             "success": True,
             "car1": car1,
             "car2": car2,
             "priority": priority,
+            "priority_result": priority_result,
             "analysis": analysis,
-            "model_used": model_used,
-            "model": "AutoNex Tiny GPT + dataset guidance" if model_used else "Grounded dataset summary",
-            "notice": "Comparison uses available dataset fields. Verify vehicle specifications before purchase."
+            # Keep the existing field for API compatibility, but return only the
+            # selected priority so clients cannot accidentally show unrelated cards.
+            "comparison_basis": [priority_result],
+            "model_used": False,
+            "model": "Priority-focused rule-based comparison",
+            "notice": "Facts come from the selected vehicle records. Missing fields are not estimated; family comfort, total ownership cost, and real-world performance may require additional information."
         }), 200
 
     except Exception:

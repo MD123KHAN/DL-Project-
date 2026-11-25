@@ -14,6 +14,7 @@ Public functions:
 
 from pathlib import Path
 from threading import Lock
+import os
 
 import torch
 import torch.nn as nn
@@ -36,7 +37,12 @@ except RuntimeError:
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "model_files"
 
-CHECKPOINT_PATH = MODEL_DIR / "autonex_tiny_gpt_checkpoint.pt"
+_checkpoint_override = os.getenv("AUTONEX_SLM_CHECKPOINT", "").strip()
+CHECKPOINT_PATH = (
+    Path(_checkpoint_override)
+    if _checkpoint_override and Path(_checkpoint_override).is_absolute()
+    else MODEL_DIR / (_checkpoint_override or "autonex_tiny_gpt_checkpoint.pt")
+)
 
 DEVICE = torch.device("cpu")
 
@@ -58,11 +64,6 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
 
-        self.register_buffer(
-            "tril",
-            torch.tril(torch.ones(block_size, block_size))
-        )
-
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -74,10 +75,16 @@ class Head(nn.Module):
         weights = query @ key.transpose(-2, -1)
         weights = weights * (key.shape[-1] ** -0.5)
 
-        weights = weights.masked_fill(
-            self.tril[:sequence_length, :sequence_length] == 0,
-            float("-inf")
-        )
+        # Build the causal mask for this sequence instead of saving one copy
+        # for every head. Older checkpoints contain repeated "tril" buffers;
+        # load_slm filters those legacy buffers before strict weight loading.
+        causal_mask = torch.ones(
+            sequence_length,
+            sequence_length,
+            dtype=torch.bool,
+            device=x.device,
+        ).triu(1)
+        weights = weights.masked_fill(causal_mask, float("-inf"))
 
         weights = F.softmax(weights, dim=-1)
         weights = self.dropout(weights)
@@ -332,10 +339,12 @@ def load_slm():
             dropout=float(config["DROPOUT"])
         )
 
-        model.load_state_dict(
-            checkpoint["model_state_dict"],
-            strict=True
-        )
+        model_state = {
+            key: value
+            for key, value in checkpoint["model_state_dict"].items()
+            if not key.endswith(".tril")
+        }
+        model.load_state_dict(model_state, strict=True)
 
         model.to(DEVICE)
         model.eval()
@@ -368,10 +377,11 @@ def generate_text(
     if not prompt:
         prompt = "AutoNex"
 
+    unknown_id = stoi.get("\ufffd")
     encoded = [
-        stoi[character]
+        stoi[character] if character in stoi else unknown_id
         for character in prompt
-        if character in stoi
+        if character in stoi or unknown_id is not None
     ]
 
     if not encoded:
@@ -396,5 +406,5 @@ def generate_text(
     return "".join(
         itos[token]
         for token in new_tokens
-        if token in itos
+        if token in itos and token != unknown_id
     )

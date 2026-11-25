@@ -92,6 +92,164 @@
                     Tata Nexon
                 </button>
             </div>
+
+            <section class="image-upload-card" aria-labelledby="imageUploadTitle">
+                <div class="image-upload-copy">
+                    <p class="eyebrow">PHOTO MATCH · DATASET SPECS</p>
+                    <h2 id="imageUploadTitle">Have a car photo?</h2>
+                    <p>
+                        Get a make/model suggestion, choose a match,
+                        then load specifications from the AutoNex dataset.
+                    </p>
+                </div>
+
+                <div class="image-upload-controls">
+                    <input
+                        id="vehiclePhotoInput"
+                        type="file"
+                        accept="image/jpeg,image/png,image/webp"
+                        aria-describedby="vehiclePhotoHint"
+                    >
+                    <label class="upload-picker" for="vehiclePhotoInput">
+                        Choose vehicle photo
+                    </label>
+                    <p id="vehiclePhotoHint" class="upload-hint">
+                        JPEG, PNG, or WebP · up to 8 MB · photo is processed in memory and not saved
+                    </p>
+
+                    <div id="uploadPreviewPanel" class="upload-preview-panel hidden">
+                        <img id="vehiclePhotoPreview" alt="Preview of the selected vehicle photo" hidden>
+                        <div class="upload-photo-actions">
+                            <button id="replacePhotoButton" type="button" class="secondary-button">Replace photo</button>
+                            <button id="removePhotoButton" type="button" class="secondary-button">Remove photo</button>
+                        </div>
+                    </div>
+
+                    <button id="recognizeVehicleButton" type="button" class="compare-button" disabled>
+                        Suggest a vehicle <span aria-hidden="true">↗</span>
+                    </button>
+                </div>
+
+                <p id="recognitionStatus" class="upload-status" role="status" aria-live="polite">
+                    Choose a photo to start. First recognition may take longer while the local model loads.
+                </p>
+
+                <div id="recognitionResult" class="recognition-result hidden">
+                    <div>
+                        <h3>Possible matches</h3>
+                        <p id="recognitionConfidence" class="upload-hint"></p>
+                        <p id="recognitionCategory" class="upload-hint"></p>
+                    </div>
+                    <label for="recognitionVehicleSelect">Choose a suggested vehicle</label>
+                    <select id="recognitionVehicleSelect" class="compare-select">
+                        <option value="">Choose a suggested make/model</option>
+                    </select>
+                    <p class="upload-hint">
+                        The photo cannot identify year, trim, price, mileage, engine, power, or other specifications.
+                    </p>
+                    <button id="loadRecognizedVehicleButton" type="button" class="compare-button" disabled>
+                        Confirm match and load dataset specs
+                    </button>
+                </div>
+            </section>
+        </section>
+
+        <section id="threePhotoCompareSection" class="three-photo-compare" aria-labelledby="threePhotoCompareTitle">
+            <div class="three-photo-heading">
+                <p class="eyebrow">THREE PHOTO SPEC COMPARISON</p>
+                <h2 id="threePhotoCompareTitle">Compare three cars <span>side by side.</span></h2>
+                <p>Drop one photo for each car. Review the suggested model, choose its dataset variant, and compare the listed specifications.</p>
+                <p class="upload-hint">Photos suggest a make and model only. Year, variant, and specifications come from the selected AutoNex dataset record.</p>
+            </div>
+
+            <div class="three-photo-slots">
+                <article class="three-photo-slot" data-photo-slot="0" aria-labelledby="threePhotoCarTitle1">
+                    <h3 id="threePhotoCarTitle1">Car 1</h3>
+                    <input class="three-photo-input" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Upload the first car photo">
+                    <div class="three-photo-dropzone" tabindex="0" role="button" aria-label="Choose or drop the first car photo">
+                        <img class="three-photo-preview" alt="First car photo preview" hidden>
+                        <span class="three-photo-prompt">Drop a car photo here<br><strong>or choose an image</strong></span>
+                    </div>
+                    <div class="three-photo-actions">
+                        <button type="button" class="secondary-button three-photo-remove" disabled>Remove photo</button>
+                        <button type="button" class="compare-button three-photo-recognize" disabled>Suggest model</button>
+                    </div>
+                    <p class="three-photo-status upload-hint" role="status" aria-live="polite">JPEG, PNG, or WebP · up to 8 MB</p>
+                    <div class="three-photo-match hidden">
+                        <label>Suggested make/model
+                            <select class="compare-select three-photo-model">
+                                <option value="">Upload and recognize a photo first</option>
+                            </select>
+                        </label>
+                        <label>Dataset variant and year
+                            <select class="compare-select three-photo-variant" disabled>
+                                <option value="">Choose a suggested model first</option>
+                            </select>
+                        </label>
+                        <button type="button" class="secondary-button three-photo-confirm" disabled>Load specifications</button>
+                    </div>
+                </article>
+
+                <article class="three-photo-slot" data-photo-slot="1" aria-labelledby="threePhotoCarTitle2">
+                    <h3 id="threePhotoCarTitle2">Car 2</h3>
+                    <input class="three-photo-input" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Upload the second car photo">
+                    <div class="three-photo-dropzone" tabindex="0" role="button" aria-label="Choose or drop the second car photo">
+                        <img class="three-photo-preview" alt="Second car photo preview" hidden>
+                        <span class="three-photo-prompt">Drop a car photo here<br><strong>or choose an image</strong></span>
+                    </div>
+                    <div class="three-photo-actions">
+                        <button type="button" class="secondary-button three-photo-remove" disabled>Remove photo</button>
+                        <button type="button" class="compare-button three-photo-recognize" disabled>Suggest model</button>
+                    </div>
+                    <p class="three-photo-status upload-hint" role="status" aria-live="polite">JPEG, PNG, or WebP · up to 8 MB</p>
+                    <div class="three-photo-match hidden">
+                        <label>Suggested make/model
+                            <select class="compare-select three-photo-model">
+                                <option value="">Upload and recognize a photo first</option>
+                            </select>
+                        </label>
+                        <label>Dataset variant and year
+                            <select class="compare-select three-photo-variant" disabled>
+                                <option value="">Choose a suggested model first</option>
+                            </select>
+                        </label>
+                        <button type="button" class="secondary-button three-photo-confirm" disabled>Load specifications</button>
+                    </div>
+                </article>
+
+                <article class="three-photo-slot" data-photo-slot="2" aria-labelledby="threePhotoCarTitle3">
+                    <h3 id="threePhotoCarTitle3">Car 3</h3>
+                    <input class="three-photo-input" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Upload the third car photo">
+                    <div class="three-photo-dropzone" tabindex="0" role="button" aria-label="Choose or drop the third car photo">
+                        <img class="three-photo-preview" alt="Third car photo preview" hidden>
+                        <span class="three-photo-prompt">Drop a car photo here<br><strong>or choose an image</strong></span>
+                    </div>
+                    <div class="three-photo-actions">
+                        <button type="button" class="secondary-button three-photo-remove" disabled>Remove photo</button>
+                        <button type="button" class="compare-button three-photo-recognize" disabled>Suggest model</button>
+                    </div>
+                    <p class="three-photo-status upload-hint" role="status" aria-live="polite">JPEG, PNG, or WebP · up to 8 MB</p>
+                    <div class="three-photo-match hidden">
+                        <label>Suggested make/model
+                            <select class="compare-select three-photo-model">
+                                <option value="">Upload and recognize a photo first</option>
+                            </select>
+                        </label>
+                        <label>Dataset variant and year
+                            <select class="compare-select three-photo-variant" disabled>
+                                <option value="">Choose a suggested model first</option>
+                            </select>
+                        </label>
+                        <button type="button" class="secondary-button three-photo-confirm" disabled>Load specifications</button>
+                    </div>
+                </article>
+            </div>
+
+            <button id="recognizeThreePhotosButton" type="button" class="compare-button" disabled>Suggest all three models together</button>
+            <p id="threePhotoBatchStatus" class="compare-status" role="status" aria-live="polite">Upload all three photos to match them in one model request.</p>
+            <button id="threePhotoCompareButton" type="button" class="compare-button" disabled>Show specifications side by side</button>
+            <p id="threePhotoCompareStatus" class="compare-status" role="status" aria-live="polite">Add three photos, then confirm a dataset vehicle for each one.</p>
+            <div id="threePhotoCompareResults" class="three-photo-results hidden" aria-live="polite"></div>
         </section>
 
         <div id="status" class="status"
@@ -171,6 +329,7 @@
                     type="text"
                     placeholder="Mahindra Thar"
                     value="Mahindra Thar"
+                    list="compareVehicleOptions"
                     maxlength="150"
                     required
                 >
@@ -185,11 +344,14 @@
                     type="text"
                     placeholder="Mahindra Scorpio N"
                     value="Mahindra Scorpio N"
+                    list="compareVehicleOptions"
                     maxlength="150"
                     required
                 >
             </label>
         </div>
+
+        <datalist id="compareVehicleOptions"></datalist>
 
         <label class="compare-question-label" for="compareQuestion">
             What matters most to you?
@@ -235,12 +397,18 @@
             <div class="ai-analysis-heading">
                 <span class="ai-indicator">AI</span>
                 <div>
-                    <h3>AutoNex AI Analysis</h3>
-                    <p id="compareAnalysisSource">AI comparison grounded in vehicle data</p>
+                    <h3>AutoNex Comparison Summary</h3>
+                    <p id="compareAnalysisSource">Summary focused on the priority you select</p>
                 </div>
             </div>
 
+            <p id="compareWinner" class="comparison-winner" aria-live="polite"></p>
             <div id="compareAnalysis" class="compare-analysis"></div>
+
+            <section class="comparison-bases" aria-labelledby="comparisonBasesTitle">
+                <h4 id="comparisonBasesTitle">Your selected priority</h4>
+                <div id="compareBasisCards" class="comparison-basis-grid"></div>
+            </section>
 
             <p id="compareDisclaimer" class="compare-disclaimer">
                 Specifications depend on the selected variant and model year.

@@ -1,8 +1,9 @@
 
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 const IS_LOCAL_FRONTEND =
     window.location.protocol === "file:" ||
-    (["localhost", "127.0.0.1"].includes(window.location.hostname) &&
-        window.location.port === "5500");
+    (LOCAL_HOSTS.has(window.location.hostname.toLowerCase()) &&
+        window.location.port !== "5000");
 const API_BASE = IS_LOCAL_FRONTEND
     ? "http://127.0.0.1:5000"
     : window.location.origin;
@@ -27,6 +28,14 @@ const imageAttribution = document.getElementById("imageAttribution");
 const specGrid = document.getElementById("specGrid");
 const sourceLink = document.getElementById("sourceLink");
 const sourceText = document.getElementById("sourceText");
+const vehiclePhotoInput = document.getElementById("vehiclePhotoInput");
+const vehiclePhotoPreview = document.getElementById("vehiclePhotoPreview");
+const uploadPreviewPanel = document.getElementById("uploadPreviewPanel");
+const recognizeVehicleButton = document.getElementById("recognizeVehicleButton");
+const recognitionStatus = document.getElementById("recognitionStatus");
+const recognitionResult = document.getElementById("recognitionResult");
+const recognitionVehicleSelect = document.getElementById("recognitionVehicleSelect");
+const loadRecognizedVehicleButton = document.getElementById("loadRecognizedVehicleButton");
 
 let suggestionItems = [];
 let activeSuggestionIndex = -1;
@@ -60,11 +69,128 @@ function escapeSearchText(value) {
 }
 
 async function readJson(response) {
+    const responseText = await response.text();
+
     try {
-        return await response.json();
+        return JSON.parse(responseText);
     } catch {
-        throw new Error("The backend returned an invalid JSON response.");
+        const status = response.status || "unknown";
+
+        if (response.status === 404) {
+            throw new Error(
+                "The running backend does not have this API route. Stop it and restart backend/app.py, then refresh the page."
+            );
+        }
+
+        if (response.status >= 500) {
+            throw new Error(
+                `The backend returned HTTP ${status} without JSON. Check the Flask terminal for the error details.`
+            );
+        }
+
+        const contentType = response.headers.get("content-type") || "an unknown content type";
+        throw new Error(
+            `Expected JSON from the backend but received ${contentType} (HTTP ${status}). Check that the current Flask API is running.`
+        );
     }
+}
+
+const vehicleSuggestionCache = new Map();
+const vehicleSuggestionRequests = new Map();
+const vehicleRecordCache = new Map();
+const vehicleRecordRequests = new Map();
+
+function keepRecentCacheValue(cache, key, value, maxEntries = 256) {
+    if (cache.size >= maxEntries && !cache.has(key)) {
+        cache.delete(cache.keys().next().value);
+    }
+    cache.set(key, value);
+}
+
+async function getVehicleSuggestions(query, limit = 10) {
+    const cacheKey = `${normalizeKey(query)}|${limit}`;
+    if (vehicleSuggestionCache.has(cacheKey)) return vehicleSuggestionCache.get(cacheKey);
+    if (vehicleSuggestionRequests.has(cacheKey)) return vehicleSuggestionRequests.get(cacheKey);
+
+    const request = (async () => {
+        const response = await fetch(
+            `${SUGGESTIONS_URL}?q=${encodeURIComponent(query)}&limit=${limit}`
+        );
+        const data = await readJson(response);
+        if (!response.ok) throw new Error(data.error || "Could not load vehicle suggestions.");
+        const suggestions = Array.isArray(data.suggestions)
+            ? data.suggestions
+            : Array.isArray(data.matches) ? data.matches : [];
+        keepRecentCacheValue(vehicleSuggestionCache, cacheKey, suggestions);
+        return suggestions;
+    })();
+
+    vehicleSuggestionRequests.set(cacheKey, request);
+    try {
+        return await request;
+    } finally {
+        if (vehicleSuggestionRequests.get(cacheKey) === request) {
+            vehicleSuggestionRequests.delete(cacheKey);
+        }
+    }
+}
+
+let visionModelReady = false;
+let visionWarmupPromise = null;
+const optimizedPhotoUploads = new WeakMap();
+
+function warmVisionModel() {
+    if (visionModelReady) return Promise.resolve(true);
+    if (visionWarmupPromise) return visionWarmupPromise;
+
+    visionWarmupPromise = (async () => {
+        const response = await fetch(`${API_BASE}/api/vision/warmup`, { method: "POST" });
+        const data = await readJson(response);
+        if (!response.ok || !data.success) {
+            throw new Error(data.error || "Could not prepare the local image model.");
+        }
+        visionModelReady = true;
+        return true;
+    })().catch(error => {
+        visionWarmupPromise = null;
+        throw error;
+    });
+
+    return visionWarmupPromise;
+}
+
+function prepareVehiclePhotoForUpload(file) {
+    if (optimizedPhotoUploads.has(file)) return optimizedPhotoUploads.get(file);
+    const preparation = (async () => {
+        if (file.size <= 512 * 1024 || typeof createImageBitmap !== "function") return file;
+        let bitmap;
+        try {
+            bitmap = await createImageBitmap(file);
+            const longestSide = Math.max(bitmap.width, bitmap.height);
+            if (longestSide <= 1024 && file.size <= 1024 * 1024) return file;
+
+            const scale = Math.min(1, 1024 / longestSide);
+            const canvas = document.createElement("canvas");
+            canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+            canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+            const context = canvas.getContext("2d");
+            if (!context) return file;
+            context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+            const compressed = await new Promise(resolve =>
+                canvas.toBlob(resolve, "image/jpeg", 0.82)
+            );
+            if (!compressed) return file;
+            if (longestSide <= 1024 && compressed.size >= file.size) return file;
+            const safeName = file.name.replace(/\.[^.]+$/, "") || "vehicle-photo";
+            return new File([compressed], `${safeName}.jpg`, { type: "image/jpeg" });
+        } catch {
+            return file;
+        } finally {
+            bitmap?.close?.();
+        }
+    })();
+    optimizedPhotoUploads.set(file, preparation);
+    return preparation;
 }
 
 // --------------------------------------------------
@@ -248,21 +374,10 @@ function selectSuggestion(item) {
 
 async function fetchSuggestions(query, requestId) {
     try {
-        const response = await fetch(
-            `${SUGGESTIONS_URL}?q=${encodeURIComponent(query)}&limit=10`
-        );
-
-        const data = await readJson(response);
+        const items = await getVehicleSuggestions(query, 10);
 
         // Ignore an older request if the user has continued typing.
         if (requestId !== latestSuggestionRequest) return;
-
-        if (!response.ok) {
-            throw new Error(data.error || "Could not load suggestions.");
-        }
-
-        const items = data.suggestions || data.matches || [];
-
         renderSuggestions(items, query);
     } catch (error) {
         if (requestId !== latestSuggestionRequest) return;
@@ -377,40 +492,50 @@ function getSearchCandidates(query) {
 // --------------------------------------------------
 
 async function fetchCar(query) {
-    const response = await fetch(
-        `${API_URL}?q=${encodeURIComponent(query)}`
-    );
+    const cacheKey = normalizeKey(query);
+    if (vehicleRecordCache.has(cacheKey)) return vehicleRecordCache.get(cacheKey);
+    if (vehicleRecordRequests.has(cacheKey)) return vehicleRecordRequests.get(cacheKey);
 
-    const data = await readJson(response);
-
-    if (!response.ok) {
-        const error = new Error(
-            data.error || `Unable to find "${query}".`
+    const request = (async () => {
+        const response = await fetch(
+            `${API_URL}?q=${encodeURIComponent(query)}`
         );
+        const data = await readJson(response);
 
-        error.status = response.status;
-        error.matches = data.matches || data.car?.matches || [];
+        if (!response.ok) {
+            const error = new Error(
+                data.error || `Unable to find "${query}".`
+            );
+            error.status = response.status;
+            error.matches = data.matches || data.car?.matches || [];
+            throw error;
+        }
 
-        throw error;
+        const car = data.car;
+        if (!car || typeof car !== "object") {
+            throw new Error("The API returned an invalid vehicle record.");
+        }
+        if (car.ambiguous) {
+            const error = new Error(
+                "More than one vehicle matched. Choose a specific suggestion."
+            );
+            error.status = 409;
+            error.matches = car.matches || [];
+            throw error;
+        }
+
+        keepRecentCacheValue(vehicleRecordCache, cacheKey, car);
+        return car;
+    })();
+
+    vehicleRecordRequests.set(cacheKey, request);
+    try {
+        return await request;
+    } finally {
+        if (vehicleRecordRequests.get(cacheKey) === request) {
+            vehicleRecordRequests.delete(cacheKey);
+        }
     }
-
-    const car = data.car;
-
-    if (!car || typeof car !== "object") {
-        throw new Error("The API returned an invalid vehicle record.");
-    }
-
-    if (car.ambiguous) {
-        const error = new Error(
-            "More than one vehicle matched. Choose a specific suggestion."
-        );
-
-        error.status = 409;
-        error.matches = car.matches || [];
-        throw error;
-    }
-
-    return car;
 }
 
 async function searchCar(query) {
@@ -965,6 +1090,7 @@ const compareQuestion = document.getElementById("compareQuestion");
 const compareButton = document.getElementById("compareButton");
 const compareStatus = document.getElementById("compareStatus");
 const compareResults = document.getElementById("compareResults");
+const compareVehicleOptions = document.getElementById("compareVehicleOptions");
 
 function setCompareStatus(message, isError = false) {
     compareStatus.textContent = message;
@@ -1090,6 +1216,112 @@ function renderComparisonSpecs(containerId, specifications) {
     });
 }
 
+function renderComparisonBasis(basisItems, firstName, secondName) {
+    const container = document.getElementById("compareBasisCards");
+    container.replaceChildren();
+
+    if (!Array.isArray(basisItems) || basisItems.length === 0) {
+        const message = document.createElement("p");
+        message.className = "comparison-basis-empty";
+        message.textContent = "A result for the selected priority is unavailable for these vehicle records.";
+        container.appendChild(message);
+        return;
+    }
+
+    const verdictLabels = {
+        car1: `Priority winner · ${firstName}`,
+        car2: `Priority winner · ${secondName}`,
+        partial_car1: `Limited data · ${firstName} leads`,
+        partial_car2: `Limited data · ${secondName} leads`,
+        partial_tie: "Limited data · no clear winner",
+        tie: "No winner · tied figures",
+        mixed: "No single winner · split result",
+        incomplete: "No clear winner · missing data",
+        incomparable: "No winner · figures differ in kind",
+        shared: "Shared capability · no winner",
+        preference: "No single winner · depends on preference",
+    };
+
+    basisItems.forEach(item => {
+        const card = document.createElement("article");
+        card.className = "comparison-basis-card";
+
+        const heading = document.createElement("div");
+        heading.className = "comparison-basis-heading";
+
+        const title = document.createElement("h5");
+        title.textContent = item.label || "Comparison area";
+
+        const verdict = document.createElement("span");
+        verdict.className = "comparison-basis-verdict";
+        const verdictCode = item.result || "incomplete";
+        verdict.textContent = verdictLabels[verdictCode] || "Review the listed details";
+        if (verdictCode === "car1" || verdictCode === "partial_car1") {
+            verdict.classList.add("vehicle-one-edge");
+        } else if (verdictCode === "car2" || verdictCode === "partial_car2") {
+            verdict.classList.add("vehicle-two-edge");
+        } else if (verdictCode === "tie" || verdictCode === "shared") {
+            verdict.classList.add("basis-tie");
+        }
+
+        heading.append(title, verdict);
+
+        const values = document.createElement("div");
+        values.className = "comparison-basis-values";
+        [[firstName, item.car1_value], [secondName, item.car2_value]].forEach(([name, value]) => {
+            const valuePanel = document.createElement("div");
+            valuePanel.className = "comparison-basis-value";
+
+            const vehicle = document.createElement("span");
+            vehicle.textContent = name;
+
+            const detail = document.createElement("strong");
+            detail.textContent = value || "Not available";
+
+            valuePanel.append(vehicle, detail);
+            values.appendChild(valuePanel);
+        });
+
+        card.append(heading, values);
+        container.appendChild(card);
+    });
+}
+
+let compareSuggestionTimer = null;
+let compareSuggestionRequestId = 0;
+
+async function loadCompareSuggestions(query, requestId) {
+    try {
+        const suggestions = await getVehicleSuggestions(query, 10);
+        if (requestId !== compareSuggestionRequestId) return;
+
+        compareVehicleOptions.replaceChildren();
+        suggestions.forEach(item => {
+            const option = document.createElement("option");
+            option.value = item.label || item.name || "";
+            if (option.value) compareVehicleOptions.appendChild(option);
+        });
+    } catch {
+        // The text inputs remain usable if autocomplete is unavailable.
+    }
+}
+
+[compareCar1Input, compareCar2Input].forEach(input => {
+    input.addEventListener("input", () => {
+        clearTimeout(compareSuggestionTimer);
+        const query = input.value.trim();
+        const requestId = ++compareSuggestionRequestId;
+        if (query.length < 2) {
+            compareVehicleOptions.replaceChildren();
+            return;
+        }
+        compareSuggestionTimer = setTimeout(
+            () => loadCompareSuggestions(query, requestId),
+            220
+        );
+    });
+});
+
 compareForm.addEventListener("submit", async (event) => {
     event.preventDefault();
 
@@ -1127,7 +1359,7 @@ compareForm.addEventListener("submit", async (event) => {
             })
         });
 
-        const data = await response.json();
+        const data = await readJson(response);
 
         if (!response.ok || !data.success) {
             throw new Error(
@@ -1151,13 +1383,30 @@ compareForm.addEventListener("submit", async (event) => {
             data.car2.specifications
         );
 
+        const priorityResult = data.priority_result || data.comparison_basis?.[0];
+        if (!priorityResult) {
+            throw new Error("The backend did not return a result for the selected priority.");
+        }
+
+        document.getElementById("compareWinner").textContent =
+            priorityResult.headline || "No clear winner could be determined.";
+        document.getElementById("compareWinner").className =
+            `comparison-winner ${["car1", "car2"].includes(priorityResult.result) ? "has-winner" : "no-winner"}`;
+
         document.getElementById("compareAnalysis").textContent =
-            data.analysis || "No analysis was returned.";
+            priorityResult.summary || data.analysis || "No explanation was returned.";
 
         document.getElementById("compareAnalysisSource").textContent =
-            data.model_used
-                ? "Generated with AutoNex Tiny GPT and grounded in vehicle data"
-                : "Grounded in the listed vehicle data";
+            `Rule-based result · ${priorityResult.priority_label || "selected priority"} · listed vehicle data`;
+
+        document.getElementById("comparisonBasesTitle").textContent =
+            priorityResult.label || "Selected priority details";
+
+        renderComparisonBasis(
+            [priorityResult],
+            data.car1.name,
+            data.car2.name
+        );
 
         document.getElementById("compareDisclaimer").textContent =
             [data.model, data.notice].filter(Boolean).join(". ") ||
@@ -1166,9 +1415,7 @@ compareForm.addEventListener("submit", async (event) => {
         compareResults.classList.remove("hidden");
 
         setCompareStatus(
-            data.model_used
-                ? "Comparison generated with AutoNex Tiny GPT."
-                : "Comparison generated from the available vehicle data."
+            `Priority comparison ready for ${(priorityResult.priority_label || "your selection").toLowerCase()}.`
         );
     } catch (error) {
         console.error("AutoNex comparison error:", error);
@@ -1180,4 +1427,676 @@ compareForm.addEventListener("submit", async (event) => {
     } finally {
         compareButton.disabled = false;
     }
+});
+
+
+/* =====================================
+   VEHICLE PHOTO SUGGESTION FLOW
+===================================== */
+
+const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
+let photoPreviewUrl = null;
+let singlePhotoWarmupId = 0;
+
+function setRecognitionStatus(message, isError = false) {
+    recognitionStatus.textContent = message;
+    recognitionStatus.classList.toggle("error", isError);
+}
+
+function clearRecognitionMatches() {
+    recognitionVehicleSelect.replaceChildren();
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Choose a suggested make/model";
+    recognitionVehicleSelect.appendChild(placeholder);
+    recognitionResult.classList.add("hidden");
+    loadRecognizedVehicleButton.disabled = true;
+}
+
+function releasePhotoPreview() {
+    if (photoPreviewUrl) {
+        URL.revokeObjectURL(photoPreviewUrl);
+        photoPreviewUrl = null;
+    }
+    vehiclePhotoPreview.removeAttribute("src");
+    vehiclePhotoPreview.hidden = true;
+}
+
+function clearVehiclePhoto() {
+    singlePhotoWarmupId += 1;
+    vehiclePhotoInput.value = "";
+    releasePhotoPreview();
+    uploadPreviewPanel.classList.add("hidden");
+    document.getElementById("replacePhotoButton").disabled = true;
+    document.getElementById("removePhotoButton").disabled = true;
+    recognizeVehicleButton.disabled = true;
+    clearRecognitionMatches();
+    setRecognitionStatus("Choose a photo to start. The local model prepares as soon as a photo is selected.");
+}
+
+function updateConfirmMatchButton() {
+    loadRecognizedVehicleButton.disabled = !recognitionVehicleSelect.value.trim();
+}
+
+vehiclePhotoInput.addEventListener("change", () => {
+    const file = vehiclePhotoInput.files?.[0];
+    if (!file) return;
+
+    const allowedTypes = ["image/jpeg", "image/png", "image/webp"];
+    if (!allowedTypes.includes(file.type)) {
+        clearVehiclePhoto();
+        setRecognitionStatus("Use a JPEG, PNG, or WebP image.", true);
+        return;
+    }
+    if (file.size > MAX_PHOTO_BYTES) {
+        clearVehiclePhoto();
+        setRecognitionStatus("Choose an image smaller than 8 MB.", true);
+        return;
+    }
+
+    releasePhotoPreview();
+    clearRecognitionMatches();
+    photoPreviewUrl = URL.createObjectURL(file);
+    vehiclePhotoPreview.src = photoPreviewUrl;
+    vehiclePhotoPreview.hidden = false;
+    uploadPreviewPanel.classList.remove("hidden");
+    document.getElementById("replacePhotoButton").disabled = false;
+    document.getElementById("removePhotoButton").disabled = false;
+    const warmupId = ++singlePhotoWarmupId;
+    recognizeVehicleButton.disabled = true;
+    setRecognitionStatus(`${file.name} is ready. Preparing the local model and vehicle labels while you review the photo…`);
+    void prepareVehiclePhotoForUpload(file);
+    warmVisionModel().then(() => {
+        if (warmupId !== singlePhotoWarmupId || vehiclePhotoInput.files?.[0] !== file) return;
+        recognizeVehicleButton.disabled = false;
+        setRecognitionStatus(`${file.name} is ready. The local model is prepared; your photo is processed in memory and not saved.`);
+    }).catch(error => {
+        if (warmupId !== singlePhotoWarmupId) return;
+        recognizeVehicleButton.disabled = !vehiclePhotoInput.files?.[0];
+        setRecognitionStatus(error.message || "Could not prepare the local image model.", true);
+    });
+});
+
+document.getElementById("replacePhotoButton").addEventListener("click", () => {
+    vehiclePhotoInput.click();
+});
+
+document.getElementById("removePhotoButton").addEventListener("click", clearVehiclePhoto);
+
+recognizeVehicleButton.addEventListener("click", async () => {
+    const file = vehiclePhotoInput.files?.[0];
+    if (!file) {
+        setRecognitionStatus("Choose a photo before asking for a match.", true);
+        return;
+    }
+
+    recognizeVehicleButton.disabled = true;
+    clearRecognitionMatches();
+    setRecognitionStatus("Preparing the local model and matching the photo against vehicle labels…");
+
+    try {
+        const [, uploadFile] = await Promise.all([
+            warmVisionModel(),
+            prepareVehiclePhotoForUpload(file),
+        ]);
+        const formData = new FormData();
+        formData.append("image", uploadFile, uploadFile.name);
+        const response = await fetch(`${API_BASE}/api/recognize`, {
+            method: "POST",
+            body: formData,
+        });
+        const data = await readJson(response);
+        if (!response.ok || !data.success) {
+            throw new Error(data.error || "Could not suggest a vehicle from this photo.");
+        }
+
+        const predictions = Array.isArray(data.predictions) ? data.predictions : [];
+        const vehicleMatches = predictions.filter(item => item.type === "vehicle");
+        const categoryMatches = predictions.filter(item => item.type === "category");
+        vehicleMatches.forEach(item => {
+            const option = document.createElement("option");
+            option.value = item.name;
+            option.textContent = `${item.name} · ${(item.score * 100).toFixed(1)}% relative score`;
+            recognitionVehicleSelect.appendChild(option);
+        });
+
+        if (data.suggested_vehicle) {
+            recognitionVehicleSelect.value = data.suggested_vehicle;
+        }
+
+        document.getElementById("recognitionConfidence").textContent = data.suggested_vehicle
+            ? `Top dataset make/model suggestion: ${data.suggested_vehicle} · ${(Number(data.confidence || 0) * 100).toFixed(1)}% relative score. This score is not calibrated certainty.`
+            : "No make/model suggestion was confident enough. Search for the vehicle by name above.";
+        document.getElementById("recognitionCategory").textContent = categoryMatches.length
+            ? `Possible vehicle category: ${categoryMatches[0].name} · approximate only.`
+            : "No category suggestion is available.";
+
+        recognitionResult.classList.remove("hidden");
+        updateConfirmMatchButton();
+        setRecognitionStatus(data.uncertain
+            ? "The image match is uncertain. Choose a listed match or search by name above."
+            : "Choose the suggested vehicle to load its dataset specifications.");
+    } catch (error) {
+        setRecognitionStatus(error.message || "Image recognition failed. You can search for the car by name.", true);
+    } finally {
+        recognizeVehicleButton.disabled = !vehiclePhotoInput.files?.[0];
+    }
+});
+
+recognitionVehicleSelect.addEventListener("change", updateConfirmMatchButton);
+
+loadRecognizedVehicleButton.addEventListener("click", () => {
+    const query = recognitionVehicleSelect.value.trim();
+    if (!query) {
+        setRecognitionStatus("Choose a suggested make/model before loading dataset specifications.", true);
+        return;
+    }
+
+    carInput.value = query;
+    searchForm.requestSubmit();
+});
+
+window.addEventListener("beforeunload", releasePhotoPreview);
+
+
+/* =====================================
+   THREE-PHOTO SPECIFICATION COMPARISON
+===================================== */
+
+const threePhotoCompareButton = document.getElementById("threePhotoCompareButton");
+const threePhotoCompareStatus = document.getElementById("threePhotoCompareStatus");
+const threePhotoCompareResults = document.getElementById("threePhotoCompareResults");
+const recognizeThreePhotosButton = document.getElementById("recognizeThreePhotosButton");
+const threePhotoBatchStatus = document.getElementById("threePhotoBatchStatus");
+let threePhotoBatchBusy = false;
+const threePhotoSlotStates = [...document.querySelectorAll(".three-photo-slot")].map(element => ({
+    element,
+    file: null,
+    previewUrl: null,
+    car: null,
+    busy: false,
+    generation: 0,
+    variantRequest: 0,
+}));
+
+function setThreePhotoStatus(slot, message, isError = false) {
+    const status = slot.element.querySelector(".three-photo-status");
+    status.textContent = message;
+    status.classList.toggle("error", isError);
+}
+
+function updateThreePhotoCompareButton() {
+    threePhotoCompareButton.disabled = !threePhotoSlotStates.every(slot => slot.car);
+}
+
+function updateThreePhotoBatchButton() {
+    recognizeThreePhotosButton.disabled = threePhotoBatchBusy ||
+        threePhotoSlotStates.some(slot => slot.busy) ||
+        !threePhotoSlotStates.every(slot => slot.file);
+}
+
+function resetThreePhotoMatch(slot) {
+    slot.variantRequest += 1;
+    slot.car = null;
+    slot.element.querySelector(".three-photo-match").classList.add("hidden");
+    const modelSelect = slot.element.querySelector(".three-photo-model");
+    const variantSelect = slot.element.querySelector(".three-photo-variant");
+    modelSelect.replaceChildren(new Option("Upload and recognize a photo first", ""));
+    variantSelect.replaceChildren(new Option("Choose a suggested model first", ""));
+    variantSelect.disabled = true;
+    slot.element.querySelector(".three-photo-confirm").disabled = true;
+    updateThreePhotoCompareButton();
+    threePhotoCompareResults.classList.add("hidden");
+    threePhotoCompareStatus.textContent = "Add three photos, then confirm a dataset vehicle for each one.";
+}
+
+function setThreePhotoBusy(slot, busy) {
+    slot.busy = busy;
+    slot.element.querySelector(".three-photo-recognize").disabled = busy || !slot.file;
+    slot.element.querySelector(".three-photo-remove").disabled = busy || !slot.file;
+    const modelSelect = slot.element.querySelector(".three-photo-model");
+    const variantSelect = slot.element.querySelector(".three-photo-variant");
+    modelSelect.disabled = busy;
+    variantSelect.disabled = busy || ![...variantSelect.options].some(option => option.value);
+    slot.element.querySelector(".three-photo-confirm").disabled = busy || !variantSelect.value;
+    updateThreePhotoBatchButton();
+}
+
+function clearThreePhoto(slot) {
+    slot.generation += 1;
+    slot.variantRequest += 1;
+    slot.busy = false;
+    slot.file = null;
+    slot.car = null;
+    if (slot.previewUrl) URL.revokeObjectURL(slot.previewUrl);
+    slot.previewUrl = null;
+    const input = slot.element.querySelector(".three-photo-input");
+    const preview = slot.element.querySelector(".three-photo-preview");
+    input.value = "";
+    preview.removeAttribute("src");
+    preview.hidden = true;
+    slot.element.querySelector(".three-photo-prompt").hidden = false;
+    slot.element.querySelector(".three-photo-dropzone").classList.remove("has-photo", "is-dragging");
+    slot.element.querySelector(".three-photo-remove").disabled = true;
+    slot.element.querySelector(".three-photo-recognize").disabled = true;
+    resetThreePhotoMatch(slot);
+    setThreePhotoStatus(slot, "JPEG, PNG, or WebP · up to 8 MB");
+    threePhotoCompareStatus.textContent = "Add three photos, then confirm a dataset vehicle for each one.";
+    updateThreePhotoBatchButton();
+}
+
+function setThreePhotoFile(slot, file) {
+    if (!file) return;
+    const allowedTypes = ["image/jpeg", "image/png", "image/webp"];
+    if (!allowedTypes.includes(file.type)) {
+        setThreePhotoStatus(slot, "Use a JPEG, PNG, or WebP image.", true);
+        return;
+    }
+    if (file.size > MAX_PHOTO_BYTES) {
+        setThreePhotoStatus(slot, "Choose an image smaller than 8 MB.", true);
+        return;
+    }
+
+    clearThreePhoto(slot);
+    slot.file = file;
+    slot.previewUrl = URL.createObjectURL(file);
+    const preview = slot.element.querySelector(".three-photo-preview");
+    preview.src = slot.previewUrl;
+    preview.hidden = false;
+    slot.element.querySelector(".three-photo-prompt").hidden = true;
+    slot.element.querySelector(".three-photo-dropzone").classList.add("has-photo");
+    slot.element.querySelector(".three-photo-remove").disabled = false;
+    const recognizeButton = slot.element.querySelector(".three-photo-recognize");
+    const generation = slot.generation;
+    recognizeButton.disabled = true;
+    setThreePhotoStatus(slot, `${file.name} is ready. Preparing the local model and vehicle labels while you review the photos…`);
+    updateThreePhotoBatchButton();
+    void prepareVehiclePhotoForUpload(file);
+    warmVisionModel().then(() => {
+        if (generation !== slot.generation || slot.file !== file) return;
+        recognizeButton.disabled = false;
+        setThreePhotoStatus(slot, `${file.name} is ready. The local model is prepared; this photo is processed in memory and not saved.`);
+    }).catch(error => {
+        if (generation !== slot.generation) return;
+        recognizeButton.disabled = false;
+        setThreePhotoStatus(slot, error.message || "Could not prepare the local image model.", true);
+    });
+}
+
+async function loadThreePhotoVariants(slot) {
+    const modelSelect = slot.element.querySelector(".three-photo-model");
+    const variantSelect = slot.element.querySelector(".three-photo-variant");
+    const modelName = modelSelect.value.trim();
+    const requestId = ++slot.variantRequest;
+    slot.car = null;
+    variantSelect.replaceChildren(new Option("Loading dataset variants…", ""));
+    variantSelect.disabled = true;
+    slot.element.querySelector(".three-photo-confirm").disabled = true;
+    updateThreePhotoCompareButton();
+    threePhotoCompareResults.classList.add("hidden");
+    threePhotoCompareStatus.textContent = "Confirm the selected dataset variant for all three cars to compare their specifications.";
+    if (!modelName) {
+        variantSelect.replaceChildren(new Option("Choose a suggested model first", ""));
+        return;
+    }
+
+    try {
+        const suggestions = await getVehicleSuggestions(modelName, 10);
+        if (requestId !== slot.variantRequest) return;
+        variantSelect.replaceChildren(new Option(
+            suggestions.length ? "Choose a variant and year" : "No matching dataset records",
+            ""
+        ));
+        suggestions.forEach(item => {
+            if (!item.label) return;
+            const option = new Option(item.label, item.label);
+            variantSelect.appendChild(option);
+        });
+        variantSelect.disabled = !suggestions.length || slot.busy;
+        setThreePhotoStatus(slot, suggestions.length
+            ? "Choose the exact variant and year shown in the dataset."
+            : "No dataset variants were found for that model. Try another suggestion.", !suggestions.length);
+    } catch (error) {
+        if (requestId !== slot.variantRequest) return;
+        variantSelect.replaceChildren(new Option("Dataset variants unavailable", ""));
+        setThreePhotoStatus(slot, error.message || "Could not load dataset variants.", true);
+    }
+}
+
+async function showThreePhotoPrediction(slot, data) {
+    const matches = (Array.isArray(data?.predictions) ? data.predictions : [])
+        .filter(item => item.type === "vehicle");
+    if (!matches.length) {
+        throw new Error("No make/model suggestions were returned for one photo. Try a clearer picture.");
+    }
+
+    const modelSelect = slot.element.querySelector(".three-photo-model");
+    modelSelect.replaceChildren(new Option("Choose a suggested make/model", ""));
+    matches.forEach(item => {
+        modelSelect.appendChild(new Option(
+            `${item.name} · ${(Number(item.score || 0) * 100).toFixed(1)}% relative score`,
+            item.name,
+        ));
+    });
+    if (!data.uncertain && data.suggested_vehicle && matches.some(item => item.name === data.suggested_vehicle)) {
+        modelSelect.value = data.suggested_vehicle;
+    }
+
+    slot.element.querySelector(".three-photo-match").classList.remove("hidden");
+    setThreePhotoStatus(slot, data.uncertain
+        ? "The image suggestion is uncertain. Choose a make/model before loading dataset variants."
+        : "Choose the dataset variant and year for this model.");
+    if (modelSelect.value) await loadThreePhotoVariants(slot);
+}
+
+threePhotoSlotStates.forEach(slot => {
+    const input = slot.element.querySelector(".three-photo-input");
+    const dropzone = slot.element.querySelector(".three-photo-dropzone");
+    const removeButton = slot.element.querySelector(".three-photo-remove");
+    const recognizeButton = slot.element.querySelector(".three-photo-recognize");
+    const modelSelect = slot.element.querySelector(".three-photo-model");
+    const variantSelect = slot.element.querySelector(".three-photo-variant");
+    const confirmButton = slot.element.querySelector(".three-photo-confirm");
+
+    dropzone.addEventListener("click", () => input.click());
+    dropzone.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            input.click();
+        }
+    });
+    input.addEventListener("change", () => setThreePhotoFile(slot, input.files?.[0]));
+    removeButton.addEventListener("click", () => clearThreePhoto(slot));
+    modelSelect.addEventListener("change", () => loadThreePhotoVariants(slot));
+    variantSelect.addEventListener("change", () => {
+        slot.car = null;
+        confirmButton.disabled = !variantSelect.value || slot.busy;
+        updateThreePhotoCompareButton();
+        threePhotoCompareResults.classList.add("hidden");
+        threePhotoCompareStatus.textContent = "Confirm the selected dataset variant for all three cars to compare their specifications.";
+    });
+
+    ["dragenter", "dragover"].forEach(type => dropzone.addEventListener(type, event => {
+        event.preventDefault();
+        dropzone.classList.add("is-dragging");
+    }));
+    ["dragleave", "dragend"].forEach(type => dropzone.addEventListener(type, event => {
+        event.preventDefault();
+        dropzone.classList.remove("is-dragging");
+    }));
+    dropzone.addEventListener("drop", event => {
+        event.preventDefault();
+        dropzone.classList.remove("is-dragging");
+        setThreePhotoFile(slot, event.dataTransfer?.files?.[0]);
+    });
+
+    recognizeButton.addEventListener("click", async () => {
+        if (!slot.file) return;
+        const generation = ++slot.generation;
+        setThreePhotoBusy(slot, true);
+        resetThreePhotoMatch(slot);
+        setThreePhotoBusy(slot, true);
+        setThreePhotoStatus(slot, "Checking this photo against the vehicle models…");
+        try {
+            const [, uploadFile] = await Promise.all([
+                warmVisionModel(),
+                prepareVehiclePhotoForUpload(slot.file),
+            ]);
+            const body = new FormData();
+            body.append("image", uploadFile, uploadFile.name);
+            const response = await fetch(`${API_BASE}/api/recognize`, { method: "POST", body });
+            const data = await readJson(response);
+            if (generation !== slot.generation) return;
+            if (!response.ok || !data.success) throw new Error(data.error || "Could not suggest a vehicle from this photo.");
+            await showThreePhotoPrediction(slot, data);
+        } catch (error) {
+            if (generation === slot.generation) setThreePhotoStatus(slot, error.message || "Image recognition failed.", true);
+        } finally {
+            if (generation === slot.generation) setThreePhotoBusy(slot, false);
+        }
+    });
+
+    confirmButton.addEventListener("click", async () => {
+        const query = variantSelect.value.trim();
+        if (!query) return;
+        const generation = slot.generation;
+        setThreePhotoBusy(slot, true);
+        setThreePhotoStatus(slot, "Loading the selected dataset specifications…");
+        try {
+            const car = normalizeThreePhotoCar(await fetchCar(query));
+            if (generation !== slot.generation) return;
+            if (car.name === "Unknown vehicle") {
+                throw new Error("The vehicle record did not include a make or model. Choose another dataset result.");
+            }
+            if (!car.specifications.length) {
+                throw new Error("The selected dataset record did not include readable specifications.");
+            }
+            slot.car = car;
+            const variant = car.variant && car.variant !== "Not available" ? ` · ${car.variant}` : "";
+            const year = car.year && car.year !== "Not available" ? ` · ${car.year}` : "";
+            setThreePhotoStatus(slot, `Specifications loaded: ${car.name}${variant}${year}.`);
+            updateThreePhotoCompareButton();
+        } catch (error) {
+            if (generation === slot.generation) setThreePhotoStatus(slot, error.message || "Could not load that dataset record.", true);
+        } finally {
+            if (generation === slot.generation) setThreePhotoBusy(slot, false);
+        }
+    });
+});
+
+recognizeThreePhotosButton.addEventListener("click", async () => {
+    if (!threePhotoSlotStates.every(slot => slot.file) || threePhotoBatchBusy) return;
+
+    const files = threePhotoSlotStates.map(slot => slot.file);
+    const generations = threePhotoSlotStates.map(slot => slot.generation);
+    threePhotoBatchBusy = true;
+    updateThreePhotoBatchButton();
+    threePhotoBatchStatus.classList.remove("error");
+    threePhotoBatchStatus.textContent = "Preparing the local model, then matching all three photos in one batch…";
+    threePhotoSlotStates.forEach(slot => setThreePhotoBusy(slot, true));
+
+    try {
+        const [, uploadFiles] = await Promise.all([
+            warmVisionModel(),
+            Promise.all(files.map(prepareVehiclePhotoForUpload)),
+        ]);
+        const body = new FormData();
+        uploadFiles.forEach(file => body.append("images", file, file.name));
+        const response = await fetch(`${API_BASE}/api/recognize/batch`, {
+            method: "POST",
+            body,
+        });
+        const data = await readJson(response);
+        if (!response.ok || !data.success) {
+            throw new Error(data.error || "Could not match the three photos.");
+        }
+        if (!Array.isArray(data.results) || data.results.length !== 3) {
+            throw new Error("The backend did not return three photo matches.");
+        }
+        const unchanged = threePhotoSlotStates.every((slot, index) =>
+            slot.generation === generations[index] && slot.file === files[index]
+        );
+        if (!unchanged) {
+            throw new Error("A photo changed during matching. Click this button again to match the current photos.");
+        }
+
+        await Promise.all(threePhotoSlotStates.map((slot, index) =>
+            showThreePhotoPrediction(slot, data.results[index])
+        ));
+        threePhotoBatchStatus.textContent = "All three photos were matched in one model request. Review each suggestion and select its dataset variant.";
+    } catch (error) {
+        threePhotoBatchStatus.textContent = error.message || "Three-photo matching failed.";
+        threePhotoBatchStatus.classList.add("error");
+    } finally {
+        threePhotoSlotStates.forEach(slot => setThreePhotoBusy(slot, false));
+        threePhotoBatchBusy = false;
+        updateThreePhotoBatchButton();
+    }
+});
+
+function normalizeThreePhotoCar(record) {
+    const source = record && typeof record === "object" ? record : {};
+    const fields = new Map(Object.entries(source).map(([key, value]) => [normalizeKey(key), value]));
+    const read = (...names) => {
+        for (const name of names) {
+            const value = fields.get(normalizeKey(name));
+            if (value !== null && value !== undefined && typeof value !== "object") {
+                const text = String(value).trim();
+                if (text && !["nan", "null", "none"].includes(text.toLowerCase())) return text;
+            }
+        }
+        return "";
+    };
+    const cleanSpecValue = value => {
+        if (value === null || value === undefined || typeof value === "object") return "";
+        const text = String(value).trim();
+        return !text || ["nan", "null", "none", "not available"].includes(text.toLowerCase())
+            ? ""
+            : text;
+    };
+
+    const manufacturer = read("manufacturer", "make");
+    const model = read("model");
+    const existingName = read("name");
+    const name = existingName || [manufacturer, model].filter(Boolean).join(" ") || "Unknown vehicle";
+    const variant = read("variant", "trim variant") || "Not available";
+    let year = read("year") || "Not available";
+    if (/^\d{4}\.0+$/.test(year)) year = String(Number(year));
+
+    const suppliedSpecs = fields.get("specifications");
+    let specifications = [];
+    if (Array.isArray(suppliedSpecs)) {
+        specifications = suppliedSpecs.map(item => ({
+            label: item?.label ?? item?.key ?? item?.name ?? item?.field ?? "",
+            value: cleanSpecValue(item?.value ?? item?.val ?? item?.display_value ?? ""),
+        })).filter(item => item.label && item.value);
+    } else if (suppliedSpecs && typeof suppliedSpecs === "object") {
+        specifications = Object.entries(suppliedSpecs)
+            .map(([label, value]) => ({ label, value: cleanSpecValue(value) }))
+            .filter(item => item.value);
+    } else {
+        const formattedPrice = read("Formatted_Price");
+        const rawPrice = read("Ex_Showroom_Price_INR");
+        const datasetFields = [
+            ["Body style", read("Body_Style")],
+            ["Doors", read("Doors")],
+            ["Seating capacity", read("Seating_Capacity")],
+            ["Drivetrain", read("Drivetrain")],
+            ["Transmission", read("Transmission")],
+            ["Fuel type", read("Fuel_Type")],
+            ["Engine displacement", read("Displacement")],
+            ["Cylinders", read("Cylinders")],
+            ["Power", read("Power_BHP")],
+            ["City mileage", read("Mileage_City")],
+            ["Highway mileage", read("Mileage_Highway")],
+            [formattedPrice ? "Ex-showroom price" : "Ex-showroom price (INR)", formattedPrice || rawPrice],
+        ];
+        specifications = [
+            ["Manufacturer", manufacturer], ["Model", model], ["Year", year], ["Variant", variant],
+            ...datasetFields,
+        ].map(([label, value]) => ({ label, value: cleanSpecValue(value) }))
+            .filter(item => item.value);
+    }
+
+    return { ...source, name, manufacturer, model, variant, year, specifications };
+}
+
+function threePhotoSpecMap(car) {
+    const values = new Map();
+    (Array.isArray(car.specifications) ? car.specifications : []).forEach(item => {
+        const label = normalizeKey(item.label ?? item.key ?? item.name ?? "");
+        const value = normalizeText(item.value ?? item.val ?? "");
+        if (label && value && value.toLowerCase() !== "not available") values.set(label, value);
+    });
+    return values;
+}
+
+function threePhotoValue(car, specs, keys) {
+    if (keys.includes("year") && car.year && car.year !== "Not available") return car.year;
+    if (keys.includes("variant") && car.variant && car.variant !== "Not available") return car.variant;
+    for (const key of keys) {
+        if (specs.has(key)) return specs.get(key);
+    }
+    if (keys.includes("price")) {
+        for (const [key, value] of specs) {
+            if (key.startsWith("ex showroom price")) return value;
+        }
+    }
+    return "Not listed";
+}
+
+function renderThreePhotoSpecs() {
+    const groups = [
+        { title: "Model and price", rows: [
+            ["Vehicle", ["model"]], ["Year", ["year"]], ["Variant", ["variant"]], ["Ex-showroom price", ["price"]],
+        ] },
+        { title: "Engine and economy", rows: [
+            ["Fuel type", ["fuel type"]], ["Engine displacement", ["engine displacement"]], ["Cylinders", ["cylinders"]],
+            ["Power", ["power"]], ["City mileage", ["city mileage"]], ["Highway mileage", ["highway mileage"]],
+        ] },
+        { title: "Space and driving", rows: [
+            ["Body style", ["body style"]], ["Doors", ["doors"]], ["Seating capacity", ["seating capacity"]],
+            ["Drivetrain", ["drivetrain"]], ["Transmission", ["transmission"]],
+        ] },
+    ];
+    const table = document.createElement("table");
+    table.className = "three-photo-spec-table";
+    const thead = document.createElement("thead");
+    const headerRow = document.createElement("tr");
+    const specHeading = document.createElement("th");
+    specHeading.scope = "col";
+    specHeading.textContent = "Specification";
+    headerRow.appendChild(specHeading);
+    threePhotoSlotStates.forEach((slot, index) => {
+        const th = document.createElement("th");
+        th.scope = "col";
+        const car = slot.car;
+        th.textContent = `${index + 1}. ${car.name}${car.variant && car.variant !== "Not available" ? ` · ${car.variant}` : ""}${car.year && car.year !== "Not available" ? ` · ${car.year}` : ""}`;
+        headerRow.appendChild(th);
+    });
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    const specMaps = threePhotoSlotStates.map(slot => threePhotoSpecMap(slot.car));
+    groups.forEach(group => {
+        const groupRow = document.createElement("tr");
+        groupRow.className = "three-photo-spec-group";
+        const groupCell = document.createElement("th");
+        groupCell.colSpan = 4;
+        groupCell.scope = "rowgroup";
+        groupCell.textContent = group.title;
+        groupRow.appendChild(groupCell);
+        tbody.appendChild(groupRow);
+        group.rows.forEach(([label, keys]) => {
+            const row = document.createElement("tr");
+            const heading = document.createElement("th");
+            heading.scope = "row";
+            heading.textContent = label;
+            row.appendChild(heading);
+            threePhotoSlotStates.forEach((slot, index) => {
+                const cell = document.createElement("td");
+                cell.textContent = label === "Vehicle"
+                    ? slot.car.name
+                    : threePhotoValue(slot.car, specMaps[index], keys);
+                row.appendChild(cell);
+            });
+            tbody.appendChild(row);
+        });
+    });
+    table.appendChild(tbody);
+    threePhotoCompareResults.replaceChildren(table);
+    threePhotoCompareResults.classList.remove("hidden");
+    threePhotoCompareStatus.textContent = "Specifications from the three selected dataset records are shown side by side.";
+}
+
+threePhotoCompareButton.addEventListener("click", () => {
+    if (!threePhotoSlotStates.every(slot => slot.car)) return;
+    renderThreePhotoSpecs();
+});
+
+window.addEventListener("beforeunload", () => {
+    threePhotoSlotStates.forEach(slot => {
+        if (slot.previewUrl) URL.revokeObjectURL(slot.previewUrl);
+    });
 });
